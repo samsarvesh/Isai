@@ -1,0 +1,176 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Global safety net: default deny everything
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isVerifiedOwner(userId) {
+      return isSignedIn() && request.auth.token.email_verified == true && request.auth.uid == userId;
+    }
+
+    function isValidFormat(fmt) {
+      return fmt is string && fmt.size() <= 16 && fmt in ['mp3', 'wav', 'flac', 'aac', 'm4a', 'ogg', 'opus', 'unknown'];
+    }
+
+    function isValidLanguage(lang) {
+      return lang is string && lang.size() <= 32 && lang in ['Tamil', 'English', 'Hindi', 'Malayalam', 'Telugu', 'Instrumental', 'Other'];
+    }
+
+    function isValidMoods(moods) {
+      return moods is list
+        && moods.size() >= 1
+        && moods.size() <= 8
+        && moods[0] is string
+        && moods[0].size() >= 1
+        && moods[0].size() <= 32
+        && moods.hasOnly(['Happy', 'Sad', 'Romantic', 'Relaxed', 'Energetic', 'Focus', 'Nostalgic', 'Motivational']);
+    }
+
+    function hasValidOptionalTrackFields(data) {
+      return (!('year' in data) || (data.year is int && data.year >= 1900 && data.year <= 2100))
+        && (!('artworkDataUrl' in data) || (data.artworkDataUrl is string && data.artworkDataUrl.size() <= 150000))
+        && (!('embeddedLyrics' in data) || (data.embeddedLyrics is string && data.embeddedLyrics.size() <= 50000))
+        && (!('lrcContent' in data) || (data.lrcContent is string && data.lrcContent.size() <= 50000));
+    }
+
+    function isValidCloudTrack(data, userId, trackId) {
+      return data.keys().hasAll([
+          'id', 'ownerId', 'title', 'artist', 'album', 'genre', 'duration',
+          'format', 'mimeType', 'fileSize', 'fileName', 'duplicateKey',
+          'language', 'moods', 'energy', 'chunkCount', 'hasArtwork',
+          'isFavorite', 'playCount', 'skipCount', 'createdAt', 'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'id', 'ownerId', 'title', 'artist', 'album', 'genre', 'year', 'duration',
+          'format', 'mimeType', 'fileSize', 'fileName', 'duplicateKey',
+          'language', 'moods', 'energy', 'chunkCount', 'hasArtwork', 'artworkDataUrl',
+          'embeddedLyrics', 'lrcContent', 'isFavorite', 'playCount', 'skipCount',
+          'createdAt', 'updatedAt'
+        ])
+        && isValidId(data.id)
+        && data.id == trackId
+        && isValidId(data.ownerId)
+        && data.ownerId == userId
+        && data.ownerId == request.auth.uid
+        && data.title is string && data.title.size() >= 1 && data.title.size() <= 200
+        && data.artist is string && data.artist.size() >= 1 && data.artist.size() <= 200
+        && data.album is string && data.album.size() >= 1 && data.album.size() <= 200
+        && data.genre is string && data.genre.size() >= 1 && data.genre.size() <= 100
+        && data.duration is number && data.duration >= 0 && data.duration <= 86400
+        && isValidFormat(data.format)
+        && data.mimeType is string && data.mimeType.size() >= 1 && data.mimeType.size() <= 100
+        && data.fileSize is int && data.fileSize >= 1 && data.fileSize <= 52428800
+        && data.fileName is string && data.fileName.size() >= 1 && data.fileName.size() <= 260
+        && data.duplicateKey is string && data.duplicateKey.size() >= 1 && data.duplicateKey.size() <= 300
+        && isValidLanguage(data.language)
+        && isValidMoods(data.moods)
+        && data.energy is number && data.energy >= 0 && data.energy <= 1
+        && data.chunkCount is int && data.chunkCount >= 1 && data.chunkCount <= 200
+        && data.hasArtwork is bool
+        && data.isFavorite is bool
+        && data.playCount is int && data.playCount >= 0
+        && data.skipCount is int && data.skipCount >= 0
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp
+        && hasValidOptionalTrackFields(data);
+    }
+
+    function isValidAudioChunk(data, userId, trackId) {
+      return data.keys().hasAll(['ownerId', 'trackId', 'index', 'data', 'createdAt'])
+        && data.keys().hasOnly(['ownerId', 'trackId', 'index', 'data', 'createdAt'])
+        && isValidId(data.ownerId)
+        && data.ownerId == userId
+        && data.ownerId == request.auth.uid
+        && isValidId(data.trackId)
+        && data.trackId == trackId
+        && data.index is int && data.index >= 0 && data.index < 200
+        && data.data is string && data.data.size() >= 1 && data.data.size() <= 460000
+        && data.createdAt is timestamp;
+    }
+
+    match /users/{userId}/cloudTracks/{trackId} {
+      allow get: if isVerifiedOwner(userId) && isValidId(trackId) && existing().ownerId == request.auth.uid;
+      allow list: if isVerifiedOwner(userId) && resource.data.ownerId == request.auth.uid;
+
+      allow create: if isVerifiedOwner(userId)
+        && isValidId(userId)
+        && isValidId(trackId)
+        && isValidCloudTrack(incoming(), userId, trackId)
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time;
+
+      allow update: if isVerifiedOwner(userId)
+        && isValidId(userId)
+        && isValidId(trackId)
+        && isValidCloudTrack(incoming(), userId, trackId)
+        && incoming().id == existing().id
+        && incoming().ownerId == existing().ownerId
+        && incoming().createdAt == existing().createdAt
+        && incoming().chunkCount == existing().chunkCount
+        && incoming().fileSize == existing().fileSize
+        && incoming().fileName == existing().fileName
+        && incoming().format == existing().format
+        && incoming().mimeType == existing().mimeType
+        && incoming().duplicateKey == existing().duplicateKey
+        && incoming().updatedAt == request.time
+        && (
+          // Action: Edit track metadata or lyrics
+          incoming().diff(existing()).affectedKeys().hasOnly([
+            'title', 'artist', 'album', 'genre', 'year', 'language', 'moods', 'energy',
+            'embeddedLyrics', 'lrcContent', 'updatedAt'
+          ]) ||
+          // Action: Toggle favorite or record play/skip stats
+          incoming().diff(existing()).affectedKeys().hasOnly([
+            'isFavorite', 'playCount', 'skipCount', 'updatedAt'
+          ])
+        );
+
+      allow delete: if isVerifiedOwner(userId) && isValidId(trackId) && existing().ownerId == request.auth.uid;
+
+      match /chunks/{chunkId} {
+        allow get: if isVerifiedOwner(userId)
+          && isValidId(trackId)
+          && isValidId(chunkId)
+          && existing().ownerId == request.auth.uid
+          && get(/databases/$(database)/documents/users/$(userId)/cloudTracks/$(trackId)).data.ownerId == request.auth.uid;
+
+        allow list: if isVerifiedOwner(userId) && resource.data.ownerId == request.auth.uid;
+
+        allow create: if isVerifiedOwner(userId)
+          && isValidId(userId)
+          && isValidId(trackId)
+          && isValidId(chunkId)
+          && isValidAudioChunk(incoming(), userId, trackId)
+          && incoming().createdAt == request.time
+          && exists(/databases/$(database)/documents/users/$(userId)/cloudTracks/$(trackId))
+          && get(/databases/$(database)/documents/users/$(userId)/cloudTracks/$(trackId)).data.ownerId == request.auth.uid;
+
+        allow update: if false;
+
+        allow delete: if isVerifiedOwner(userId)
+          && isValidId(trackId)
+          && isValidId(chunkId)
+          && existing().ownerId == request.auth.uid;
+      }
+    }
+  }
+}

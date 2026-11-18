@@ -1,0 +1,6 @@
+{
+  "name": "ISAI",
+  "description": "Clean personal music player with a relaxing live wallpaper, Firebase Cloud Locker, local audio playback, and synchronized LRC lyrics.",
+  "requestFramePermissions": [],
+  "majorCapabilities": []
+}
