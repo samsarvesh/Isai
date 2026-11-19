@@ -3,6 +3,7 @@ import type { User } from 'firebase/auth';
 import {
   addListeningEvent,
   clearAllLocalData,
+  clearDriveCacheForUser,
   DEFAULT_AI_MEMORY,
   DEFAULT_SETTINGS,
   deletePlaylist,
@@ -10,30 +11,53 @@ import {
   getAllPlaylists,
   getAllTracks,
   getArtworkUrl,
+  getDriveCatalogCache,
   getListeningHistory,
   getSettings,
   removeTrackFromLibrary,
   saveAIMemory,
+  saveDriveCatalogCache,
   savePlaylist,
   saveSettings,
   updateTrack,
 } from '../db/sonoraDb';
 import { useOnlineStatus } from '../hooks/useOnlineStatus';
+import {
+  clearActivityStore,
+  type DailyActivityStore,
+  loadActivityStore,
+  mergeHistoryBackfill,
+  recordSessionOpen,
+  recordSongHeardInStore,
+  saveActivityStore,
+  tickActivitySecond,
+} from '../services/analyticsService';
 import { audioEngine } from '../services/audioEngine';
 import {
+  getDriveAccessToken,
   isCloudWriteQuotaExceeded,
   signInWithFirebaseGoogle,
   signOutFirebase,
   subscribeToFirebaseAuth,
 } from '../services/firebaseClient';
 import {
+  deleteAllFirebaseCloudTracks,
   deleteFirebaseCloudTrack,
+  fetchFirebaseCloudTracksOnce,
+  isFirebaseLockerConfirmedEmpty,
   saveLocalCloudTrackStats,
-  subscribeFirebaseCloudTracks,
+  setFirebaseLockerConfirmedEmpty,
   updateFirebaseCloudTrackMetadata,
   updateFirebaseCloudTrackStats,
-  uploadFilesToFirebaseCloud,
 } from '../services/firebaseMusicService';
+import {
+  deleteGoogleDriveTrack,
+  DriveAuthExpiredError,
+  listGoogleDriveTracks,
+  resetDriveRuntimeCache,
+  updateGoogleDriveTrackMetadata,
+  uploadFilesToGoogleDrive,
+} from '../services/googleDriveMusicService';
 import { collectFilesFromDirectoryHandle, importAudioFiles } from '../services/importer';
 import { findSimilarTracks, fisherYatesShuffle, smartShuffleTracks } from '../utils/trackUtils';
 import {
@@ -65,27 +89,41 @@ interface SonoraContextValue {
   tracks: Track[];
   localTracks: Track[];
   firebaseTracks: Track[];
+  driveTracks: Track[];
   trackMap: Map<string, Track>;
   playlists: Playlist[];
   history: ListeningEvent[];
+  activityStore: DailyActivityStore;
+  resetAnalytics: () => void;
   aiMemory: AIMemory;
   settings: AppSettings;
   isLoadingData: boolean;
   isOnline: boolean;
 
-  // Firebase Cloud Music Locker
+  // Cloud Music Locker (Google Drive primary + legacy Firebase reads)
   firebaseUser: User | null;
   isFirebaseConnected: boolean;
+  isDriveConnected: boolean;
+  needsDriveReconnect: boolean;
   isFirebaseSigningIn: boolean;
   isSyncingCloud: boolean;
   cloudUploadProgress: { done: number; total: number; fileName: string } | null;
+  isDeletingAllFirebase: boolean;
+  firebaseDeleteProgress: { done: number; total: number; title: string } | null;
+  hideLegacyFirebaseTracks: boolean;
+  setHideLegacyFirebaseTracks: (hidden: boolean) => void;
+  deleteAllFirebaseTracks: () => Promise<void>;
   pendingCloudDeleteTrack: Track | null;
+  pendingDriveUpdateTrack: Track | null;
   connectFirebaseCloud: () => Promise<void>;
   disconnectFirebaseCloud: () => Promise<void>;
+  refreshDriveLibrary: () => Promise<void>;
   uploadFilesToCloud: (files: FileList | File[]) => Promise<void>;
   requestDeleteCloudTrack: (track: Track) => void;
   confirmDeleteCloudTrack: () => Promise<void>;
   cancelDeleteCloudTrack: () => void;
+  confirmDriveUpdateTrack: () => Promise<void>;
+  cancelDriveUpdateTrack: () => void;
 
   // Navigation & Modals
   activeView: NavView;
@@ -134,6 +172,7 @@ interface SonoraContextValue {
   playTrackNext: (track: Track) => void;
   removeFromQueue: (index: number) => void;
   reorderQueue: (fromIndex: number, toIndex: number) => void;
+  reorderUpcomingQueue: (fromUpcomingIndex: number, toUpcomingIndex: number) => void;
   clearQueue: () => void;
   toggleShuffle: () => void;
   cycleRepeat: () => void;
@@ -173,15 +212,37 @@ export const SonoraProvider: React.FC<{ children: React.ReactNode }> = ({ childr
   const isOnline = useOnlineStatus();
   const [localTracks, setLocalTracks] = useState<Track[]>([]);
   const [firebaseTracks, setFirebaseTracks] = useState<Track[]>([]);
+  const [driveTracks, setDriveTracks] = useState<Track[]>([]);
 
   const [firebaseUser, setFirebaseUser] = useState<User | null>(null);
   const [isFirebaseConnected, setIsFirebaseConnected] = useState(false);
+  const [isDriveConnected, setIsDriveConnected] = useState(false);
   const [isFirebaseSigningIn, setIsFirebaseSigningIn] = useState(false);
   const [isSyncingCloud, setIsSyncingCloud] = useState(false);
   const [cloudUploadProgress, setCloudUploadProgress] = useState<{ done: number; total: number; fileName: string } | null>(null);
+  const [isDeletingAllFirebase, setIsDeletingAllFirebase] = useState(false);
+  const [firebaseDeleteProgress, setFirebaseDeleteProgress] = useState<{ done: number; total: number; title: string } | null>(null);
+  const [hideLegacyFirebaseTracks, setHideLegacyFirebaseTracksState] = useState<boolean>(() => {
+    try {
+      return localStorage.getItem('isai_hide_legacy_firebase_v1') === 'true';
+    } catch {
+      return false;
+    }
+  });
+  const setHideLegacyFirebaseTracks = useCallback((hidden: boolean) => {
+    setHideLegacyFirebaseTracksState(hidden);
+    try {
+      localStorage.setItem('isai_hide_legacy_firebase_v1', hidden ? 'true' : 'false');
+    } catch {
+      // ignore storage errors
+    }
+  }, []);
   const [pendingCloudDeleteTrack, setPendingCloudDeleteTrack] = useState<Track | null>(null);
+  const [pendingDriveUpdateTrack, setPendingDriveUpdateTrack] = useState<Track | null>(null);
 
   const [playlists, setPlaylists] = useState<Playlist[]>([]);
+  const playlistsRef = useRef<Playlist[]>([]);
+  playlistsRef.current = playlists;
   const [history, setHistory] = useState<ListeningEvent[]>([]);
   const [aiMemory, setAiMemory] = useState<AIMemory>(DEFAULT_AI_MEMORY);
   const [settings, setSettings] = useState<AppSettings>(DEFAULT_SETTINGS);
@@ -217,7 +278,18 @@ export const SonoraProvider: React.FC<{ children: React.ReactNode }> = ({ childr
 
   const [queue, setQueue] = useState<Track[]>([]);
   const [queueIndex, setQueueIndex] = useState<number>(-1);
+  const queueRef = useRef<Track[]>([]);
+  const queueIndexRef = useRef<number>(-1);
+  queueRef.current = queue;
+  queueIndexRef.current = queueIndex;
   const [isPlaying, setIsPlaying] = useState(false);
+  const isPlayingRef = useRef(false);
+  isPlayingRef.current = isPlaying;
+  const [activityStore, setActivityStore] = useState<DailyActivityStore>(() =>
+    recordSessionOpen(loadActivityStore())
+  );
+  const activityStoreRef = useRef<DailyActivityStore>(activityStore);
+  activityStoreRef.current = activityStore;
   const [currentTime, setCurrentTime] = useState(0);
   const [duration, setDuration] = useState(0);
   const [shuffle, setShuffle] = useState(false);
@@ -236,14 +308,24 @@ export const SonoraProvider: React.FC<{ children: React.ReactNode }> = ({ childr
     }, 3600);
   }, []);
 
-  const tracks = useMemo(() => [...firebaseTracks, ...localTracks], [firebaseTracks, localTracks]);
+  const visibleFirebaseTracks = useMemo(
+    () => (hideLegacyFirebaseTracks ? [] : firebaseTracks),
+    [firebaseTracks, hideLegacyFirebaseTracks]
+  );
+
+  const tracks = useMemo(
+    () => [...driveTracks, ...visibleFirebaseTracks, ...localTracks],
+    [driveTracks, visibleFirebaseTracks, localTracks]
+  );
   const trackMap = useMemo(() => {
     const map = new Map<string, Track>();
     for (const t of localTracks) map.set(t.id, t);
-    for (const t of firebaseTracks) map.set(t.id, t);
+    for (const t of visibleFirebaseTracks) map.set(t.id, t);
+    for (const t of driveTracks) map.set(t.id, t);
     return map;
-  }, [firebaseTracks, localTracks]);
+  }, [driveTracks, visibleFirebaseTracks, localTracks]);
   const currentTrack = queueIndex >= 0 && queueIndex < queue.length ? queue[queueIndex] : null;
+  const needsDriveReconnect = isFirebaseConnected && !isDriveConnected;
 
   const refreshAllData = useCallback(async () => {
     const [loadedTracks, loadedPlaylists, loadedHistory, loadedMemory, loadedSettings] = await Promise.all([
@@ -256,6 +338,7 @@ export const SonoraProvider: React.FC<{ children: React.ReactNode }> = ({ childr
     setLocalTracks(loadedTracks.sort((a, b) => b.dateAdded - a.dateAdded));
     setPlaylists(loadedPlaylists.sort((a, b) => b.updatedAt - a.updatedAt));
     setHistory(loadedHistory);
+    setActivityStore((prev) => mergeHistoryBackfill(prev, loadedHistory));
     setAiMemory(loadedMemory);
     setSettings(loadedSettings);
     audioEngine.setVolume(loadedSettings.volume);
@@ -264,60 +347,147 @@ export const SonoraProvider: React.FC<{ children: React.ReactNode }> = ({ childr
     setIsLoadingData(false);
   }, []);
 
-  const connectFirebaseCloud = useCallback(async () => {
+  const syncDriveLibrary = useCallback(
+    async (tokenOverride?: string | null, userIdOverride?: string | null) => {
+      const token = tokenOverride ?? getDriveAccessToken();
+      if (!token) {
+        setIsDriveConnected(false);
+        return;
+      }
+      setIsSyncingCloud(true);
+      try {
+        const list = await listGoogleDriveTracks(token);
+        setDriveTracks(list);
+        setIsDriveConnected(true);
+        const uid = userIdOverride ?? firebaseUser?.uid;
+        if (uid) {
+          void saveDriveCatalogCache(uid, list);
+        }
+      } catch (err) {
+        if (err instanceof DriveAuthExpiredError) {
+          setIsDriveConnected(false);
+        }
+        notify(err instanceof Error ? err.message : 'Unable to sync Google Drive Music Locker.', 'error');
+      } finally {
+        setIsSyncingCloud(false);
+      }
+    },
+    [firebaseUser?.uid, notify]
+  );
+
+  const ensureDriveToken = useCallback(async (): Promise<string | null> => {
+    const existing = getDriveAccessToken();
+    if (existing) {
+      setIsDriveConnected(true);
+      return existing;
+    }
     setIsFirebaseSigningIn(true);
     try {
-      const user = await signInWithFirebaseGoogle();
+      const { user, accessToken } = await signInWithFirebaseGoogle();
       setFirebaseUser(user);
       setIsFirebaseConnected(true);
-      notify(`Connected Firebase Cloud (${user.email || 'Account ready'}).`, 'success');
+      if (accessToken) {
+        setIsDriveConnected(true);
+        return accessToken;
+      }
+      setIsDriveConnected(false);
+      return null;
     } catch (err) {
-      notify(err instanceof Error ? err.message : 'Google sign-in was cancelled or failed.', 'error');
+      notify(err instanceof Error ? err.message : 'Google Drive authorization was cancelled.', 'error');
+      return null;
     } finally {
       setIsFirebaseSigningIn(false);
     }
   }, [notify]);
 
+  const refreshDriveLibrary = useCallback(async () => {
+    const token = await ensureDriveToken();
+    if (!token) return;
+    await syncDriveLibrary(token);
+  }, [ensureDriveToken, syncDriveLibrary]);
+
+  const connectFirebaseCloud = useCallback(async () => {
+    setIsFirebaseSigningIn(true);
+    try {
+      const { user, accessToken } = await signInWithFirebaseGoogle();
+      setFirebaseUser(user);
+      setIsFirebaseConnected(true);
+      if (accessToken) {
+        setIsDriveConnected(true);
+        notify(`Signed in to Google Drive (${user.email || 'Account ready'}).`, 'success');
+        await syncDriveLibrary(accessToken, user.uid);
+      } else {
+        setIsDriveConnected(false);
+        notify('Signed in, but Google Drive access was not granted. Click Connect Google Drive again and allow Drive access.', 'info');
+      }
+    } catch (err) {
+      notify(err instanceof Error ? err.message : 'Google sign-in was cancelled or failed.', 'error');
+    } finally {
+      setIsFirebaseSigningIn(false);
+    }
+  }, [notify, syncDriveLibrary]);
+
   const disconnectFirebaseCloud = useCallback(async () => {
+    const uid = firebaseUser?.uid;
     await signOutFirebase();
+    resetDriveRuntimeCache();
+    if (uid) {
+      await clearDriveCacheForUser(uid);
+    }
     setFirebaseUser(null);
     setIsFirebaseConnected(false);
+    setIsDriveConnected(false);
     setFirebaseTracks([]);
-    notify('Signed out of Firebase Cloud.', 'info');
-  }, [notify]);
+    setDriveTracks([]);
+    notify('Signed out of Google Drive & Cloud Locker.', 'info');
+  }, [firebaseUser?.uid, notify]);
 
   const uploadFilesToCloud = useCallback(
     async (fileList: FileList | File[]) => {
       const files = Array.from(fileList);
       if (files.length === 0) return;
-      if (!firebaseUser) {
-        notify('Please sign in with Google first to upload songs to your Firebase Cloud library.', 'info');
+
+      const token = await ensureDriveToken();
+      if (!token) {
+        notify('Connect Google Drive to upload songs to your Google Drive Music Locker.', 'info');
         return;
       }
 
       setCloudUploadProgress({ done: 0, total: files.length, fileName: files[0].name });
       try {
-        const res = await uploadFilesToFirebaseCloud(firebaseUser.uid, files, (done, total, fileName) => {
+        const res = await uploadFilesToGoogleDrive(token, files, (done, total, fileName) => {
           setCloudUploadProgress({ done, total, fileName });
         });
         setCloudUploadProgress(null);
 
         if (res.uploaded.length > 0) {
+          setDriveTracks((prev) => {
+            const seen = new Set(res.uploaded.map((t) => t.id));
+            const next = [...res.uploaded, ...prev.filter((t) => !seen.has(t.id))];
+            if (firebaseUser?.uid) {
+              void saveDriveCatalogCache(firebaseUser.uid, next);
+            }
+            return next;
+          });
+          const skippedMsg = res.skipped.length > 0 ? ` (${res.skipped.length} skipped)` : '';
           notify(
-            `Uploaded ${res.uploaded.length} song${res.uploaded.length === 1 ? '' : 's'} to Firebase Cloud. You can now delete the local copies from your laptop to free space.`,
+            `Uploaded ${res.uploaded.length} song${res.uploaded.length === 1 ? '' : 's'} to Google Drive${skippedMsg}.`,
             'success'
           );
         } else if (res.skipped.length > 0) {
-          notify(res.skipped[0].reason || 'No supported audio files uploaded.', 'error');
+          notify(res.skipped[0].reason || 'No new supported audio files uploaded.', 'info');
         } else {
           notify('No supported audio files found in selection.', 'error');
         }
       } catch (err) {
         setCloudUploadProgress(null);
-        notify(err instanceof Error ? err.message : 'Firebase Cloud upload failed.', 'error');
+        if (err instanceof DriveAuthExpiredError) {
+          setIsDriveConnected(false);
+        }
+        notify(err instanceof Error ? err.message : 'Google Drive upload failed.', 'error');
       }
     },
-    [firebaseUser, notify]
+    [ensureDriveToken, firebaseUser?.uid, notify]
   );
 
   const requestDeleteCloudTrack = useCallback((track: Track) => {
@@ -326,56 +496,209 @@ export const SonoraProvider: React.FC<{ children: React.ReactNode }> = ({ childr
 
   const confirmDeleteCloudTrack = useCallback(async () => {
     const target = pendingCloudDeleteTrack;
-    if (!target || !target.firebaseDocId || !firebaseUser) {
+    if (!target) {
       setPendingCloudDeleteTrack(null);
       return;
     }
+
     try {
-      await deleteFirebaseCloudTrack(firebaseUser.uid, target.firebaseDocId);
-      setFirebaseTracks((prev) => prev.filter((t) => t.id !== target.id));
-      setQueue((prev) => prev.filter((t) => t.id !== target.id));
-      notify(`Deleted "${target.title}" from Firebase Cloud.`, 'info');
+      if (target.sourceType === 'gdrive' && target.driveFileId) {
+        const token = await ensureDriveToken();
+        if (!token) {
+          setIsDriveConnected(false);
+          notify('Google Drive authorization is required to delete this song.', 'info');
+          setPendingCloudDeleteTrack(null);
+          return;
+        }
+        await deleteGoogleDriveTrack(token, target.driveFileId);
+        setDriveTracks((prev) => {
+          const next = prev.filter((t) => t.id !== target.id);
+          if (firebaseUser?.uid) {
+            void saveDriveCatalogCache(firebaseUser.uid, next);
+          }
+          return next;
+        });
+        setQueue((prev) => prev.filter((t) => t.id !== target.id));
+        notify(`Deleted "${target.title}" from Google Drive.`, 'info');
+      } else if (target.sourceType === 'firebase' && target.firebaseDocId && firebaseUser) {
+        await deleteFirebaseCloudTrack(firebaseUser.uid, target.firebaseDocId);
+        setFirebaseTracks((prev) => prev.filter((t) => t.id !== target.id));
+        setQueue((prev) => prev.filter((t) => t.id !== target.id));
+        notify(`Deleted "${target.title}" from Firebase Cloud.`, 'info');
+      }
     } catch (err) {
-      notify(err instanceof Error ? err.message : 'Could not delete song from Firebase Cloud.', 'error');
+      if (err instanceof DriveAuthExpiredError) {
+        setIsDriveConnected(false);
+      }
+      notify(err instanceof Error ? err.message : 'Could not delete song from cloud.', 'error');
     } finally {
       setPendingCloudDeleteTrack(null);
     }
-  }, [firebaseUser, notify, pendingCloudDeleteTrack]);
+  }, [ensureDriveToken, firebaseUser, notify, pendingCloudDeleteTrack]);
+
+  const deleteAllFirebaseTracks = useCallback(async () => {
+    if (!firebaseUser) {
+      notify('Sign in with Google first to remove songs from Firebase Cloud.', 'info');
+      return;
+    }
+    if (isDeletingAllFirebase) return;
+
+    setIsDeletingAllFirebase(true);
+    setFirebaseDeleteProgress({
+      done: 0,
+      total: firebaseTracks.length || 1,
+      title: firebaseTracks[0]?.title || 'Loading Firebase Cloud songs...',
+    });
+
+    try {
+      const result = await deleteAllFirebaseCloudTracks(firebaseUser.uid, (done, total, title) => {
+        setFirebaseDeleteProgress({ done, total, title });
+      });
+
+      if (result.deletedIds.length > 0) {
+        const deletedSet = new Set(result.deletedIds);
+        setFirebaseTracks((prev) => prev.filter((t) => !deletedSet.has(t.id)));
+        setQueue((prev) => {
+          const next = prev.filter((t) => !deletedSet.has(t.id));
+          if (currentTrack && deletedSet.has(currentTrack.id)) {
+            audioEngine.pause();
+            setIsPlaying(false);
+            setQueueIndex(next.length > 0 ? 0 : -1);
+          }
+          return next;
+        });
+
+        // Clean removed Firebase track IDs out of any local playlists
+        const affectedPlaylists = playlists.filter((pl) => pl.trackIds.some((id) => deletedSet.has(id)));
+        if (affectedPlaylists.length > 0) {
+          const updatedPlaylists = playlists.map((pl) => {
+            if (!pl.trackIds.some((id) => deletedSet.has(id))) return pl;
+            return {
+              ...pl,
+              trackIds: pl.trackIds.filter((id) => !deletedSet.has(id)),
+              updatedAt: Date.now(),
+            };
+          });
+          setPlaylists(updatedPlaylists);
+          await Promise.all(
+            updatedPlaylists
+              .filter((pl) => affectedPlaylists.some((ap) => ap.id === pl.id))
+              .map((pl) => savePlaylist(pl))
+          );
+        }
+      }
+
+      if (result.quotaHit) {
+        notify(
+          result.deletedIds.length > 0
+            ? `Removed ${result.deletedIds.length} song(s) from Firebase Cloud. ${result.remainingCount} remaining hit today's Firestore daily write limit — retry after midnight PT or click Hide.`
+            : `Firebase Cloud's daily write quota is currently full (${result.remainingCount} song(s) remaining). Retry after midnight PT or click Hide to remove them from ISAI now.`,
+          'error'
+        );
+      } else if (result.deletedIds.length === 0) {
+        setFirebaseLockerConfirmedEmpty(firebaseUser.uid, true);
+        notify('No songs found in Firebase Cloud.', 'info');
+      } else {
+        setFirebaseLockerConfirmedEmpty(firebaseUser.uid, result.remainingCount === 0);
+        setHideLegacyFirebaseTracks(false);
+        notify(
+          `Removed all ${result.deletedIds.length} song${result.deletedIds.length === 1 ? '' : 's'} from Firebase Cloud.`,
+          'success'
+        );
+      }
+    } catch (err) {
+      notify(err instanceof Error ? err.message : 'Unable to remove songs from Firebase Cloud.', 'error');
+    } finally {
+      setIsDeletingAllFirebase(false);
+      setFirebaseDeleteProgress(null);
+    }
+  }, [currentTrack, firebaseTracks, firebaseUser, isDeletingAllFirebase, notify, playlists, setHideLegacyFirebaseTracks]);
+
+  const confirmDriveUpdateTrack = useCallback(async () => {
+    const updated = pendingDriveUpdateTrack;
+    if (!updated || updated.sourceType !== 'gdrive') {
+      setPendingDriveUpdateTrack(null);
+      return;
+    }
+    const token = await ensureDriveToken();
+    if (!token) {
+      setIsDriveConnected(false);
+      notify('Google Drive authorization is required to save changes.', 'info');
+      setPendingDriveUpdateTrack(null);
+      return;
+    }
+    try {
+      await updateGoogleDriveTrackMetadata(token, updated);
+      setDriveTracks((prev) => {
+        const next = prev.map((t) => (t.id === updated.id ? updated : t));
+        if (firebaseUser?.uid) {
+          void saveDriveCatalogCache(firebaseUser.uid, next);
+        }
+        return next;
+      });
+      setQueue((prev) => prev.map((t) => (t.id === updated.id ? updated : t)));
+      notify(`Updated "${updated.title}" in Google Drive.`, 'success');
+    } catch (err) {
+      if (err instanceof DriveAuthExpiredError) {
+        setIsDriveConnected(false);
+      }
+      notify(err instanceof Error ? err.message : 'Unable to update song in Google Drive.', 'error');
+    } finally {
+      setPendingDriveUpdateTrack(null);
+    }
+  }, [ensureDriveToken, firebaseUser?.uid, notify, pendingDriveUpdateTrack]);
 
   useEffect(() => {
     void refreshAllData();
-    const unsub = subscribeToFirebaseAuth((user) => {
+    const unsub = subscribeToFirebaseAuth((user, driveToken) => {
       if (user) {
         setFirebaseUser(user);
         setIsFirebaseConnected(true);
+        // Immediately restore the user's cached Google Drive song library from IndexedDB so daily opens work with zero re-login
+        void getDriveCatalogCache(user.uid).then((cachedTracks) => {
+          if (cachedTracks.length > 0) {
+            setDriveTracks((prev) => (prev.length > 0 ? prev : cachedTracks));
+          }
+        });
+        if (driveToken) {
+          setIsDriveConnected(true);
+          void syncDriveLibrary(driveToken, user.uid);
+        } else {
+          setIsDriveConnected(false);
+        }
       } else {
+        resetDriveRuntimeCache();
         setFirebaseUser(null);
         setIsFirebaseConnected(false);
+        setIsDriveConnected(false);
         setFirebaseTracks([]);
+        setDriveTracks([]);
       }
     });
     return () => unsub();
-  }, [refreshAllData]);
+  }, [refreshAllData, syncDriveLibrary]);
 
   useEffect(() => {
-    if (!firebaseUser || !firebaseUser.emailVerified) {
-      setIsSyncingCloud(false);
+    if (!isOnline || !firebaseUser || !firebaseUser.emailVerified || hideLegacyFirebaseTracks) {
       return;
     }
-    setIsSyncingCloud(true);
-    const unsub = subscribeFirebaseCloudTracks(
-      firebaseUser.uid,
-      (remoteTracks) => {
-        setFirebaseTracks(remoteTracks);
-        setIsSyncingCloud(false);
-      },
-      (err) => {
-        setIsSyncingCloud(false);
-        notify(err.message || 'Unable to sync Firebase Cloud songs.', 'error');
-      }
-    );
-    return () => unsub();
-  }, [firebaseUser, notify]);
+    if (isFirebaseLockerConfirmedEmpty(firebaseUser.uid)) {
+      return;
+    }
+    let cancelled = false;
+    void fetchFirebaseCloudTracksOnce(firebaseUser.uid)
+      .then((remoteTracks) => {
+        if (!cancelled) {
+          setFirebaseTracks(remoteTracks);
+        }
+      })
+      .catch(() => {
+        // Legacy Firebase tracks are optional fallback; silently ignore transient offline/unavailable errors
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [firebaseUser, hideLegacyFirebaseTracks, isOnline]);
 
   // Apply dark theme & accent CSS tokens cleanly to <html>
   useEffect(() => {
@@ -417,6 +740,12 @@ export const SonoraProvider: React.FC<{ children: React.ReactNode }> = ({ childr
       if (track.sourceType === 'local') {
         await updateTrack(updatedTrack);
         setLocalTracks((prev) => prev.map((t) => (t.id === track.id ? updatedTrack : t)));
+      } else if (track.sourceType === 'gdrive') {
+        setDriveTracks((prev) => prev.map((t) => (t.id === track.id ? updatedTrack : t)));
+        saveLocalCloudTrackStats(track.id, {
+          playCount: updatedTrack.playCount,
+          lastPlayedAt: updatedTrack.lastPlayedAt,
+        });
       } else if (track.sourceType === 'firebase') {
         setFirebaseTracks((prev) => prev.map((t) => (t.id === track.id ? updatedTrack : t)));
         saveLocalCloudTrackStats(track.id, {
@@ -434,6 +763,7 @@ export const SonoraProvider: React.FC<{ children: React.ReactNode }> = ({ childr
       };
       await addListeningEvent(ev);
       setHistory((prev) => [...prev, ev]);
+      setActivityStore((prev) => recordSongHeardInStore(prev));
 
       await updateAIMemory((prev) => ({
         ...prev,
@@ -451,18 +781,20 @@ export const SonoraProvider: React.FC<{ children: React.ReactNode }> = ({ childr
         },
       }));
     },
-    [firebaseUser, updateAIMemory]
+    [updateAIMemory]
   );
 
   const playTrackAtIndex = useCallback(
-    async (targetQueue: Track[], index: number) => {
+    async (targetQueue: Track[], index: number, crossfadeOverride?: number) => {
       const target = targetQueue[index];
       if (!target) return;
       if (target.sourceType === 'firebase' && !isOnline) {
-        notify('This Firebase Cloud stream requires an internet connection.', 'error');
+        notify('This legacy Firebase Cloud song requires an internet connection.', 'error');
         return;
       }
 
+      queueRef.current = targetQueue;
+      queueIndexRef.current = index;
       setQueue(targetQueue);
       setQueueIndex(index);
       setCurrentTime(0);
@@ -470,13 +802,12 @@ export const SonoraProvider: React.FC<{ children: React.ReactNode }> = ({ childr
       trackPlayRecordedRef.current = null;
 
       try {
-        await audioEngine.playTrack(target, settings.crossfadeSeconds);
+        const effectiveCrossfade = crossfadeOverride !== undefined ? crossfadeOverride : settings.crossfadeSeconds;
+        await audioEngine.playTrack(target, effectiveCrossfade);
         // Update Media Session API for OS / Bluetooth / Android lock-screen controls
         if ('mediaSession' in navigator) {
-          let artUrl: string | null = target.artworkUrl || null;
-          if (!artUrl && target.hasArtwork) {
-            artUrl = await getArtworkUrl(target.id);
-          }
+          const localArtUrl = await getArtworkUrl(target.id);
+          const artUrl: string | null = localArtUrl || target.artworkUrl || null;
           navigator.mediaSession.metadata = new MediaMetadata({
             title: target.title,
             artist: target.artist,
@@ -485,6 +816,9 @@ export const SonoraProvider: React.FC<{ children: React.ReactNode }> = ({ childr
           });
         }
       } catch (err) {
+        if (err instanceof DriveAuthExpiredError) {
+          setIsDriveConnected(false);
+        }
         const msg = err instanceof Error ? err.message : 'Playback failed for this track.';
         notify(msg, 'error');
       }
@@ -494,18 +828,28 @@ export const SonoraProvider: React.FC<{ children: React.ReactNode }> = ({ childr
 
   const playTrack = useCallback(
     async (track: Track, newQueue?: Track[]) => {
-      const targetQueue = newQueue && newQueue.length > 0 ? newQueue : [track];
+      // If clicking a track inside the currently active queue (e.g. QueueDrawer), jump directly to its index without reshuffling
+      if (newQueue && newQueue === queueRef.current && newQueue.length > 0) {
+        const directIdx = newQueue.findIndex((t) => t.id === track.id);
+        if (directIdx >= 0) {
+          await playTrackAtIndex(newQueue, directIdx, 0);
+          return;
+        }
+      }
+
+      const fallbackQueue = tracks.length > 0 ? (tracks.some((t) => t.id === track.id) ? tracks : [track, ...tracks]) : [track];
+      const targetQueue = newQueue && newQueue.length > 0 ? newQueue : fallbackQueue;
       if (shuffle && targetQueue.length > 1) {
         const rest = settings.smartShuffle
           ? smartShuffleTracks(targetQueue, track.id)
           : fisherYatesShuffle(targetQueue.filter((t) => t.id !== track.id));
-        await playTrackAtIndex([track, ...rest], 0);
+        await playTrackAtIndex([track, ...rest], 0, 0);
         return;
       }
       const idx = targetQueue.findIndex((t) => t.id === track.id);
-      await playTrackAtIndex(targetQueue, idx >= 0 ? idx : 0);
+      await playTrackAtIndex(targetQueue, idx >= 0 ? idx : 0, 0);
     },
-    [playTrackAtIndex, settings.smartShuffle, shuffle]
+    [playTrackAtIndex, settings.smartShuffle, shuffle, tracks]
   );
 
   const playTracksList = useCallback(
@@ -528,9 +872,9 @@ export const SonoraProvider: React.FC<{ children: React.ReactNode }> = ({ childr
           }
         }
         setShuffle(true);
-        await playTrackAtIndex(ordered, 0);
+        await playTrackAtIndex(ordered, 0, 0);
       } else {
-        await playTrackAtIndex(list, startIndex ?? 0);
+        await playTrackAtIndex(list, startIndex ?? 0, 0);
       }
     },
     [currentTrack, playTrackAtIndex, settings.smartShuffle, shuffle]
@@ -546,20 +890,37 @@ export const SonoraProvider: React.FC<{ children: React.ReactNode }> = ({ childr
     if (isPlaying) {
       audioEngine.pause();
     } else {
-      await audioEngine.resume();
+      try {
+        await audioEngine.resume();
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : 'Unable to resume playback.';
+        notify(msg, 'error');
+      }
     }
-  }, [currentTrack, isPlaying, playTracksList, shuffle, tracks]);
+  }, [currentTrack, isPlaying, notify, playTracksList, shuffle, tracks]);
 
   const playNext = useCallback(
     async (manualSkip = true) => {
-      if (queue.length === 0) return;
+      const activeQueue = queueRef.current;
+      const activeIndex = queueIndexRef.current;
+      const activeTrack = activeIndex >= 0 && activeIndex < activeQueue.length ? activeQueue[activeIndex] : null;
 
-      if (manualSkip && currentTrack && currentTime < 20 && (currentTrack.sourceType === 'local' || currentTrack.sourceType === 'firebase')) {
-        const updated = { ...currentTrack, skipCount: currentTrack.skipCount + 1 };
-        if (currentTrack.sourceType === 'local') {
+      if (activeQueue.length === 0) {
+        if (tracks.length > 0) {
+          await playTracksList(tracks, shuffle ? undefined : 0, shuffle);
+        }
+        return;
+      }
+
+      if (manualSkip && activeTrack && audioEngine.getCurrentTime() < 20) {
+        const updated = { ...activeTrack, skipCount: activeTrack.skipCount + 1 };
+        if (activeTrack.sourceType === 'local') {
           void updateTrack(updated);
           setLocalTracks((prev) => prev.map((t) => (t.id === updated.id ? updated : t)));
-        } else if (currentTrack.sourceType === 'firebase') {
+        } else if (activeTrack.sourceType === 'gdrive') {
+          setDriveTracks((prev) => prev.map((t) => (t.id === updated.id ? updated : t)));
+          saveLocalCloudTrackStats(updated.id, { skipCount: updated.skipCount });
+        } else if (activeTrack.sourceType === 'firebase') {
           setFirebaseTracks((prev) => prev.map((t) => (t.id === updated.id ? updated : t)));
           saveLocalCloudTrackStats(updated.id, { skipCount: updated.skipCount });
         }
@@ -575,38 +936,77 @@ export const SonoraProvider: React.FC<{ children: React.ReactNode }> = ({ childr
 
       if (repeat === 'one' && !manualSkip) {
         audioEngine.seek(0);
+        setCurrentTime(0);
         await audioEngine.resume();
         return;
       }
 
-      const nextIndex = queueIndex + 1;
-      if (nextIndex < queue.length) {
-        await playTrackAtIndex(queue, nextIndex);
-      } else if (repeat === 'all') {
-        await playTrackAtIndex(queue, 0);
+      // If the active queue only has 1 song but the library has more, expand to the full library on manual Next
+      if (manualSkip && activeQueue.length <= 1 && tracks.length > 1) {
+        const currentId = activeTrack?.id;
+        const rest = shuffle
+          ? settings.smartShuffle
+            ? smartShuffleTracks(tracks, currentId)
+            : fisherYatesShuffle(tracks.filter((t) => t.id !== currentId))
+          : (() => {
+              const curIdx = tracks.findIndex((t) => t.id === currentId);
+              if (curIdx < 0) return tracks.filter((t) => t.id !== currentId);
+              return [...tracks.slice(curIdx + 1), ...tracks.slice(0, curIdx)];
+            })();
+        if (rest.length > 0) {
+          const expanded = activeTrack ? [activeTrack, ...rest] : rest;
+          await playTrackAtIndex(expanded, activeTrack ? 1 : 0, 0);
+          return;
+        }
+      }
+
+      const nextIndex = activeIndex + 1;
+      const crossfade = manualSkip ? 0 : settings.crossfadeSeconds;
+      if (nextIndex < activeQueue.length) {
+        await playTrackAtIndex(activeQueue, nextIndex, crossfade);
+      } else if (repeat === 'all' || manualSkip) {
+        // Wrap around to the first track on Repeat All or explicit Next button click
+        await playTrackAtIndex(activeQueue, 0, crossfade);
       } else {
         audioEngine.pause();
         setIsPlaying(false);
       }
     },
-    [currentTime, currentTrack, playTrackAtIndex, queue, queueIndex, repeat, updateAIMemory]
+    [playTrackAtIndex, playTracksList, repeat, settings.crossfadeSeconds, settings.smartShuffle, shuffle, tracks, updateAIMemory]
   );
 
   const playPrevious = useCallback(async () => {
-    if (queue.length === 0) return;
-    if (currentTime > 4) {
-      audioEngine.seek(0);
+    const activeQueue = queueRef.current;
+    const activeIndex = queueIndexRef.current;
+    const activeTrack = activeIndex >= 0 && activeIndex < activeQueue.length ? activeQueue[activeIndex] : null;
+
+    if (activeQueue.length === 0) {
+      if (tracks.length > 0) {
+        await playTrackAtIndex(tracks, tracks.length - 1, 0);
+      }
       return;
     }
-    const prevIndex = queueIndex - 1;
-    if (prevIndex >= 0) {
-      await playTrackAtIndex(queue, prevIndex);
-    } else if (repeat === 'all') {
-      await playTrackAtIndex(queue, queue.length - 1);
-    } else {
-      audioEngine.seek(0);
+
+    // If the active queue only has 1 song but the library has more, expand to the full library and jump to the previous track
+    if (activeQueue.length <= 1 && tracks.length > 1) {
+      const currentId = activeTrack?.id;
+      const curIdx = tracks.findIndex((t) => t.id === currentId);
+      const prevLibIdx = curIdx > 0 ? curIdx - 1 : tracks.length - 1;
+      await playTrackAtIndex(tracks, prevLibIdx, 0);
+      return;
     }
-  }, [currentTime, playTrackAtIndex, queue, queueIndex, repeat]);
+
+    if (activeQueue.length > 1) {
+      const prevIndex = activeIndex > 0 ? activeIndex - 1 : activeQueue.length - 1;
+      await playTrackAtIndex(activeQueue, prevIndex, 0);
+      return;
+    }
+
+    // Only 1 song exists in total: restart it from 0:00
+    audioEngine.seek(0);
+    setCurrentTime(0);
+    await audioEngine.resume();
+  }, [playTrackAtIndex, tracks]);
 
   // Wire Web Audio Engine callbacks
   useEffect(() => {
@@ -614,7 +1014,7 @@ export const SonoraProvider: React.FC<{ children: React.ReactNode }> = ({ childr
       onTimeUpdate: (time, dur) => {
         setCurrentTime(time);
         if (dur > 0) setDuration(dur);
-        if (currentTrack && time >= Math.min(12, (dur || 30) * 0.35) && trackPlayRecordedRef.current !== currentTrack.id) {
+        if (currentTrack && time >= Math.min(8, (dur || 24) * 0.3) && trackPlayRecordedRef.current !== currentTrack.id) {
           trackPlayRecordedRef.current = currentTrack.id;
           void recordPlayCompletion(currentTrack, time, true);
         }
@@ -681,26 +1081,44 @@ export const SonoraProvider: React.FC<{ children: React.ReactNode }> = ({ childr
         return;
       }
 
+      if (e.ctrlKey || e.metaKey || e.altKey) return;
+
+      const key = e.key.toLowerCase();
       if (e.code === 'Space') {
         e.preventDefault();
         void togglePlayPause();
       } else if (e.key === 'ArrowRight') {
+        e.preventDefault();
         if (e.shiftKey) void playNext(true);
         else audioEngine.seek(audioEngine.getCurrentTime() + 5);
       } else if (e.key === 'ArrowLeft') {
+        e.preventDefault();
         if (e.shiftKey) void playPrevious();
         else audioEngine.seek(Math.max(0, audioEngine.getCurrentTime() - 5));
-      } else if (e.key.toLowerCase() === 'm') {
+      } else if (e.key === 'ArrowUp' || e.key === 'ArrowDown') {
+        if (target?.closest('[role="listbox"]')) return;
+        e.preventDefault();
+        const delta = (e.key === 'ArrowUp' ? 1 : -1) * (e.shiftKey ? 0.1 : 0.05);
+        const nextVol = Math.max(0, Math.min(1, Math.round((settings.volume + delta) * 100) / 100));
+        audioEngine.setVolume(nextVol);
+        void updateSettings({ volume: nextVol });
+      } else if (key === 'n') {
+        e.preventDefault();
+        void playNext(true);
+      } else if (key === 'p') {
+        e.preventDefault();
+        void playPrevious();
+      } else if (key === 'm') {
         const nextVol = settings.volume > 0 ? 0 : 0.85;
         audioEngine.setVolume(nextVol);
         void updateSettings({ volume: nextVol });
-      } else if (e.key.toLowerCase() === 'l') {
+      } else if (key === 'l') {
         setActiveView('lyrics');
-      } else if (e.key.toLowerCase() === 'f') {
+      } else if (key === 'f') {
         if (currentTrack) setIsFullPlayerOpen((prev) => !prev);
-      } else if (e.key.toLowerCase() === 's') {
+      } else if (key === 's') {
         setShuffle((prev) => !prev);
-      } else if (e.key.toLowerCase() === 'r') {
+      } else if (key === 'r') {
         setRepeat((prev) => (prev === 'off' ? 'all' : prev === 'all' ? 'one' : 'off'));
       }
     };
@@ -776,6 +1194,50 @@ export const SonoraProvider: React.FC<{ children: React.ReactNode }> = ({ childr
       });
     },
     [queueIndex]
+  );
+
+  const reorderUpcomingQueue = useCallback(
+    (fromUpcomingIndex: number, toUpcomingIndex: number) => {
+      if (fromUpcomingIndex === toUpcomingIndex) return;
+      const activeQueue = queueRef.current;
+      const activeIdx = queueIndexRef.current;
+      if (activeQueue.length === 0) return;
+
+      if (activeIdx >= 0 && activeIdx < activeQueue.length) {
+        const current = activeQueue[activeIdx];
+        const upcoming = [...activeQueue.slice(activeIdx + 1), ...activeQueue.slice(0, activeIdx)];
+        if (
+          fromUpcomingIndex < 0 ||
+          fromUpcomingIndex >= upcoming.length ||
+          toUpcomingIndex < 0 ||
+          toUpcomingIndex >= upcoming.length
+        ) {
+          return;
+        }
+        const [moved] = upcoming.splice(fromUpcomingIndex, 1);
+        upcoming.splice(toUpcomingIndex, 0, moved);
+        const nextQueue = [current, ...upcoming];
+        queueRef.current = nextQueue;
+        queueIndexRef.current = 0;
+        setQueue(nextQueue);
+        setQueueIndex(0);
+      } else {
+        const copy = [...activeQueue];
+        if (
+          fromUpcomingIndex < 0 ||
+          fromUpcomingIndex >= copy.length ||
+          toUpcomingIndex < 0 ||
+          toUpcomingIndex >= copy.length
+        ) {
+          return;
+        }
+        const [moved] = copy.splice(fromUpcomingIndex, 1);
+        copy.splice(toUpcomingIndex, 0, moved);
+        queueRef.current = copy;
+        setQueue(copy);
+      }
+    },
+    []
   );
 
   const clearQueue = useCallback(() => {
@@ -963,6 +1425,9 @@ export const SonoraProvider: React.FC<{ children: React.ReactNode }> = ({ childr
       if (target.sourceType === 'local') {
         await updateTrack(updated);
         setLocalTracks((prev) => prev.map((t) => (t.id === trackId ? updated : t)));
+      } else if (target.sourceType === 'gdrive') {
+        setDriveTracks((prev) => prev.map((t) => (t.id === trackId ? updated : t)));
+        saveLocalCloudTrackStats(trackId, { isFavorite: updated.isFavorite });
       } else if (target.sourceType === 'firebase') {
         setFirebaseTracks((prev) => prev.map((t) => (t.id === trackId ? updated : t)));
         saveLocalCloudTrackStats(trackId, { isFavorite: updated.isFavorite });
@@ -979,8 +1444,68 @@ export const SonoraProvider: React.FC<{ children: React.ReactNode }> = ({ childr
         }
       }
       setQueue((prev) => prev.map((t) => (t.id === trackId ? updated : t)));
+
+      // Automatically sync with the "Liked" playlist
+      const existingLiked = playlistsRef.current.find((p) => p.name.trim().toLowerCase() === 'liked');
+      const now = Date.now();
+
+      if (updated.isFavorite) {
+        if (existingLiked) {
+          if (!existingLiked.trackIds.includes(trackId)) {
+            const nextTrackIds = [trackId, ...existingLiked.trackIds];
+            const nextPlaylist: Playlist = {
+              ...existingLiked,
+              trackIds: nextTrackIds,
+              artworkTrackId: existingLiked.artworkTrackId || (target.hasArtwork ? trackId : undefined),
+              updatedAt: now,
+            };
+            await savePlaylist(nextPlaylist);
+            const nextList = playlistsRef.current.map((p) => (p.id === nextPlaylist.id ? nextPlaylist : p));
+            playlistsRef.current = nextList;
+            setPlaylists(nextList);
+          }
+        } else {
+          // Create the "Liked" playlist (including any previously favorited tracks)
+          const priorLikedIds = tracks
+            .filter((t) => t.id !== trackId && t.isFavorite)
+            .map((t) => t.id);
+          const initialTrackIds = [trackId, ...priorLikedIds];
+          const firstArtTrack = initialTrackIds.find((id) => trackMap.get(id)?.hasArtwork);
+          const newLikedPlaylist: Playlist = {
+            id: crypto.randomUUID(),
+            name: 'Liked',
+            description: 'Songs you liked in ISAI',
+            trackIds: initialTrackIds,
+            artworkTrackId: firstArtTrack,
+            createdAt: now,
+            updatedAt: now,
+          };
+          await savePlaylist(newLikedPlaylist);
+          const nextList = [newLikedPlaylist, ...playlistsRef.current];
+          playlistsRef.current = nextList;
+          setPlaylists(nextList);
+        }
+        notify(`Added "${target.title}" to Liked.`, 'success');
+      } else if (existingLiked && existingLiked.trackIds.includes(trackId)) {
+        const nextTrackIds = existingLiked.trackIds.filter((id) => id !== trackId);
+        const nextArtworkId =
+          existingLiked.artworkTrackId === trackId
+            ? nextTrackIds.find((id) => trackMap.get(id)?.hasArtwork)
+            : existingLiked.artworkTrackId;
+        const nextPlaylist: Playlist = {
+          ...existingLiked,
+          trackIds: nextTrackIds,
+          artworkTrackId: nextArtworkId,
+          updatedAt: now,
+        };
+        await savePlaylist(nextPlaylist);
+        const nextList = playlistsRef.current.map((p) => (p.id === nextPlaylist.id ? nextPlaylist : p));
+        playlistsRef.current = nextList;
+        setPlaylists(nextList);
+        notify(`Removed "${target.title}" from Liked.`, 'info');
+      }
     },
-    [firebaseUser, notify, trackMap]
+    [firebaseUser, notify, trackMap, tracks]
   );
 
   const saveTrackEdits = useCallback(
@@ -988,6 +1513,10 @@ export const SonoraProvider: React.FC<{ children: React.ReactNode }> = ({ childr
       if (updated.sourceType === 'local') {
         await updateTrack(updated);
         setLocalTracks((prev) => prev.map((t) => (t.id === updated.id ? updated : t)));
+      } else if (updated.sourceType === 'gdrive') {
+        // Require explicit user confirmation before overwriting catalog data in Google Drive
+        setPendingDriveUpdateTrack(updated);
+        return;
       } else if (updated.sourceType === 'firebase') {
         if (firebaseUser && updated.firebaseDocId) {
           try {
@@ -1008,7 +1537,7 @@ export const SonoraProvider: React.FC<{ children: React.ReactNode }> = ({ childr
   const deleteTrackFromLibrary = useCallback(
     async (trackId: string) => {
       const target = trackMap.get(trackId);
-      if (target?.sourceType === 'firebase') {
+      if (target?.sourceType === 'firebase' || target?.sourceType === 'gdrive') {
         setPendingCloudDeleteTrack(target);
         return;
       }
@@ -1102,10 +1631,63 @@ export const SonoraProvider: React.FC<{ children: React.ReactNode }> = ({ childr
     setActiveView('playlist-detail');
   }, []);
 
+  // Live 1-second app usage & playback listening time tracker
+  useEffect(() => {
+    let ticksSinceSave = 0;
+    const flush = () => {
+      saveActivityStore(activityStoreRef.current);
+      ticksSinceSave = 0;
+    };
+
+    const timer = window.setInterval(() => {
+      const playing = isPlayingRef.current;
+      const visible = document.visibilityState === 'visible';
+      if (!visible && !playing) return;
+
+      setActivityStore((prev) => {
+        const next = tickActivitySecond(prev, playing);
+        activityStoreRef.current = next;
+        ticksSinceSave += 1;
+        if (ticksSinceSave >= 5) {
+          saveActivityStore(next);
+          ticksSinceSave = 0;
+        }
+        return next;
+      });
+    }, 1000);
+
+    const onVisibility = () => {
+      if (document.visibilityState === 'hidden') flush();
+    };
+    window.addEventListener('pagehide', flush);
+    window.addEventListener('beforeunload', flush);
+    document.addEventListener('visibilitychange', onVisibility);
+
+    return () => {
+      window.clearInterval(timer);
+      flush();
+      window.removeEventListener('pagehide', flush);
+      window.removeEventListener('beforeunload', flush);
+      document.removeEventListener('visibilitychange', onVisibility);
+    };
+  }, []);
+
+  const resetAnalytics = useCallback(() => {
+    clearActivityStore();
+    const fresh = recordSessionOpen({});
+    activityStoreRef.current = fresh;
+    setActivityStore(fresh);
+    notify('Listening & app usage analytics reset.', 'info');
+  }, [notify]);
+
   const resetLibraryData = useCallback(async () => {
     audioEngine.pause();
     setQueue([]);
     setQueueIndex(-1);
+    clearActivityStore();
+    const fresh = recordSessionOpen({});
+    activityStoreRef.current = fresh;
+    setActivityStore(fresh);
     await clearAllLocalData();
     await refreshAllData();
     notify('All local ISAI library data cleared.', 'info');
@@ -1115,25 +1697,39 @@ export const SonoraProvider: React.FC<{ children: React.ReactNode }> = ({ childr
     tracks,
     localTracks,
     firebaseTracks,
+    driveTracks,
     trackMap,
     playlists,
     history,
+    activityStore,
+    resetAnalytics,
     aiMemory,
     settings,
     isLoadingData,
     isOnline,
     firebaseUser,
     isFirebaseConnected,
+    isDriveConnected,
+    needsDriveReconnect,
     isFirebaseSigningIn,
     isSyncingCloud,
     cloudUploadProgress,
+    isDeletingAllFirebase,
+    firebaseDeleteProgress,
+    hideLegacyFirebaseTracks,
+    setHideLegacyFirebaseTracks,
+    deleteAllFirebaseTracks,
     pendingCloudDeleteTrack,
+    pendingDriveUpdateTrack,
     connectFirebaseCloud,
     disconnectFirebaseCloud,
+    refreshDriveLibrary,
     uploadFilesToCloud,
     requestDeleteCloudTrack,
     confirmDeleteCloudTrack,
     cancelDeleteCloudTrack: () => setPendingCloudDeleteTrack(null),
+    confirmDriveUpdateTrack,
+    cancelDriveUpdateTrack: () => setPendingDriveUpdateTrack(null),
     activeView,
     setActiveView,
     selectedPlaylistId,
@@ -1174,6 +1770,7 @@ export const SonoraProvider: React.FC<{ children: React.ReactNode }> = ({ childr
     playTrackNext,
     removeFromQueue,
     reorderQueue,
+    reorderUpcomingQueue,
     clearQueue,
     toggleShuffle,
     cycleRepeat,

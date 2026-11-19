@@ -18,7 +18,7 @@ interface SonoraDBSchema extends DBSchema {
   };
   artworks: {
     key: string;
-    value: { id: string; blob: Blob; mimeType: string };
+    value: { id: string; blob: Blob; mimeType: string; isHd?: boolean };
   };
   playlists: {
     key: string;
@@ -37,10 +37,14 @@ interface SonoraDBSchema extends DBSchema {
     key: string;
     value: AppSettings;
   };
+  driveCatalog: {
+    key: string;
+    value: { id: string; updatedAt: number; tracks: Track[] };
+  };
 }
 
 const DB_NAME = 'sonora-ecosystem-db';
-const DB_VERSION = 1;
+const DB_VERSION = 2;
 
 let dbPromise: Promise<IDBPDatabase<SonoraDBSchema>> | null = null;
 
@@ -74,6 +78,9 @@ export function getDb(): Promise<IDBPDatabase<SonoraDBSchema>> {
         }
         if (!db.objectStoreNames.contains('settings')) {
           db.createObjectStore('settings', { keyPath: 'id' });
+        }
+        if (!db.objectStoreNames.contains('driveCatalog')) {
+          db.createObjectStore('driveCatalog', { keyPath: 'id' });
         }
       },
     });
@@ -111,6 +118,22 @@ export const DEFAULT_AI_MEMORY: AIMemory = {
 
 // In-memory LRU artwork URL cache so virtualized/lazy artwork never leaks object URLs
 const artworkUrlCache = new Map<string, string>();
+const artworkListeners = new Map<string, Set<(url: string) => void>>();
+
+export function subscribeArtworkUpdates(trackId: string, listener: (url: string) => void): () => void {
+  let set = artworkListeners.get(trackId);
+  if (!set) {
+    set = new Set();
+    artworkListeners.set(trackId, set);
+  }
+  set.add(listener);
+  return () => {
+    set?.delete(listener);
+    if (set && set.size === 0) {
+      artworkListeners.delete(trackId);
+    }
+  };
+}
 
 export async function getArtworkUrl(trackId: string): Promise<string | null> {
   if (artworkUrlCache.has(trackId)) {
@@ -121,6 +144,42 @@ export async function getArtworkUrl(trackId: string): Promise<string | null> {
   if (!record) return null;
   const url = URL.createObjectURL(record.blob);
   artworkUrlCache.set(trackId, url);
+  return url;
+}
+
+export async function hasLocalArtwork(trackId: string): Promise<boolean> {
+  if (artworkUrlCache.has(trackId)) return true;
+  const db = await getDb();
+  const key = await db.getKey('artworks', trackId);
+  return key !== undefined;
+}
+
+export async function getArtworkRecord(
+  trackId: string
+): Promise<{ id: string; blob: Blob; mimeType: string; isHd?: boolean } | null> {
+  const db = await getDb();
+  const rec = await db.get('artworks', trackId);
+  return rec ?? null;
+}
+
+export async function saveTrackArtwork(
+  trackId: string,
+  blob: Blob,
+  mimeType: string,
+  isHd = false
+): Promise<string> {
+  const db = await getDb();
+  await db.put('artworks', { id: trackId, blob, mimeType: mimeType || blob.type || 'image/jpeg', isHd });
+  const prev = artworkUrlCache.get(trackId);
+  const url = URL.createObjectURL(blob);
+  artworkUrlCache.set(trackId, url);
+  if (prev && prev !== url) {
+    window.setTimeout(() => URL.revokeObjectURL(prev), 3000);
+  }
+  const listeners = artworkListeners.get(trackId);
+  if (listeners) {
+    for (const cb of listeners) cb(url);
+  }
   return url;
 }
 
@@ -183,6 +242,79 @@ export async function getAudioBlob(trackId: string): Promise<Blob | null> {
   const db = await getDb();
   const rec = await db.get('audioFiles', trackId);
   return rec?.blob ?? null;
+}
+
+export async function saveCachedDriveAudio(trackId: string, blob: Blob): Promise<void> {
+  try {
+    const db = await getDb();
+    await db.put('audioFiles', { id: trackId, blob });
+  } catch {
+    // ignore IndexedDB quota pressure on huge libraries
+  }
+}
+
+export async function getCachedDriveAudio(trackId: string): Promise<Blob | null> {
+  try {
+    const db = await getDb();
+    const rec = await db.get('audioFiles', trackId);
+    return rec?.blob ?? null;
+  } catch {
+    return null;
+  }
+}
+
+export async function deleteCachedDriveTrackMedia(trackId: string): Promise<void> {
+  try {
+    const db = await getDb();
+    revokeArtworkUrl(trackId);
+    const tx = db.transaction(['audioFiles', 'artworks'], 'readwrite');
+    await tx.objectStore('audioFiles').delete(trackId);
+    await tx.objectStore('artworks').delete(trackId);
+    await tx.done;
+  } catch {
+    // ignore cleanup errors
+  }
+}
+
+export async function saveDriveCatalogCache(userId: string, tracks: Track[]): Promise<void> {
+  try {
+    const db = await getDb();
+    await db.put('driveCatalog', {
+      id: userId,
+      updatedAt: Date.now(),
+      tracks,
+    });
+  } catch {
+    // ignore cache errors
+  }
+}
+
+export async function getDriveCatalogCache(userId: string): Promise<Track[]> {
+  try {
+    const db = await getDb();
+    const rec = await db.get('driveCatalog', userId);
+    return rec?.tracks ?? [];
+  } catch {
+    return [];
+  }
+}
+
+export async function clearDriveCacheForUser(userId: string): Promise<void> {
+  try {
+    const db = await getDb();
+    const rec = await db.get('driveCatalog', userId);
+    const driveTrackIds = (rec?.tracks || []).map((t) => t.id);
+    const tx = db.transaction(['driveCatalog', 'audioFiles', 'artworks'], 'readwrite');
+    await tx.objectStore('driveCatalog').delete(userId);
+    for (const id of driveTrackIds) {
+      revokeArtworkUrl(id);
+      await tx.objectStore('audioFiles').delete(id);
+      await tx.objectStore('artworks').delete(id);
+    }
+    await tx.done;
+  } catch {
+    // ignore cleanup errors
+  }
 }
 
 export async function getAllPlaylists(): Promise<Playlist[]> {

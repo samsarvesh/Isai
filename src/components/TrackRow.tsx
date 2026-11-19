@@ -121,7 +121,11 @@ export const TrackRow: React.FC<TrackRowProps> = ({
           <span className="shrink-0">{track.language}</span>
           <span aria-hidden="true">·</span>
           <span className="shrink-0 uppercase font-mono text-[13px]">
-            {track.sourceType === 'local' ? track.format : 'Firebase Cloud'}
+            {track.sourceType === 'local'
+              ? track.format
+              : track.sourceType === 'gdrive'
+              ? 'Google Drive'
+              : 'Firebase Cloud'}
           </span>
         </div>
       </div>
@@ -236,7 +240,11 @@ export const TrackRow: React.FC<TrackRowProps> = ({
                   className="w-full flex items-center gap-2.5 px-3.5 py-2 text-sm text-left text-rose-400 hover:bg-[var(--bg-hover)] cursor-pointer"
                 >
                   <Trash2 className="w-4 h-4" />{' '}
-                  {track.sourceType === 'firebase' ? 'Delete from Firebase Cloud' : 'Remove from Player'}
+                  {track.sourceType === 'gdrive'
+                    ? 'Delete from Google Drive'
+                    : track.sourceType === 'firebase'
+                    ? 'Delete from Firebase Cloud'
+                    : 'Remove from Player'}
                 </button>
               </div>
             </div>

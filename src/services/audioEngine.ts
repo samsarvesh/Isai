@@ -1,6 +1,8 @@
-import { getAudioBlob } from '../db/sonoraDb';
-import { auth } from './firebaseClient';
+import { getAudioBlob, getCachedDriveAudio } from '../db/sonoraDb';
+import { auth, getDriveAccessToken, signInWithFirebaseGoogle } from './firebaseClient';
 import { fetchFirebaseCloudAudioBlob } from './firebaseMusicService';
+import { ensureLosslessArtworkFromAudioBlob, fetchGoogleDriveAudioBlob } from './googleDriveMusicService';
+import { upgradeTrackArtworkToHdIfNeeded } from './hdArtworkService';
 import { EQ_FREQUENCIES, type Track } from '../types/music';
 
 type DeckName = 'A' | 'B';
@@ -37,6 +39,7 @@ class SonoraAudioEngine {
   private currentSpeed = 1;
   private currentEqGains = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
   private crossfadeTimer: number | null = null;
+  private playRequestId = 0;
 
   constructor() {
     const createEl = () => {
@@ -145,6 +148,31 @@ class SonoraAudioEngine {
       }
       return { url: URL.createObjectURL(blob), isObjectUrl: true };
     }
+    if (track.sourceType === 'gdrive') {
+      // 1. Play immediately from local IndexedDB cache if already uploaded or streamed on this device (zero login required)
+      const cachedBlob = await getCachedDriveAudio(track.id);
+      if (cachedBlob) {
+        void ensureLosslessArtworkFromAudioBlob(track.id, cachedBlob);
+        return { url: URL.createObjectURL(cachedBlob), isObjectUrl: true };
+      }
+
+      if (!track.driveFileId) {
+        throw new Error('Google Drive file reference is missing for this track.');
+      }
+
+      // 2. If not cached yet on this device and the 1-hour in-memory token expired, seamlessly renew using the active signed-in Google account
+      let token = getDriveAccessToken();
+      if (!token && auth.currentUser) {
+        const renewed = await signInWithFirebaseGoogle();
+        token = renewed.accessToken;
+      }
+      if (!token) {
+        throw new Error('Sign in with Google Drive to stream this uncached song.');
+      }
+      const mime = track.mimeType || (track.format === 'mp3' ? 'audio/mpeg' : `audio/${track.format}`);
+      const blob = await fetchGoogleDriveAudioBlob(token, track.driveFileId, mime, track.id);
+      return { url: URL.createObjectURL(blob), isObjectUrl: true };
+    }
     if (track.sourceType === 'firebase') {
       const uid = auth.currentUser?.uid;
       if (!uid || !track.firebaseDocId) {
@@ -152,6 +180,7 @@ class SonoraAudioEngine {
       }
       const mime = track.format === 'mp3' ? 'audio/mpeg' : `audio/${track.format}`;
       const blob = await fetchFirebaseCloudAudioBlob(uid, track.firebaseDocId, mime);
+      void ensureLosslessArtworkFromAudioBlob(track.id, blob);
       return { url: URL.createObjectURL(blob), isObjectUrl: true };
     }
     throw new Error('Audio source is unavailable.');
@@ -165,11 +194,21 @@ class SonoraAudioEngine {
     }
   }
 
+  private isPlayInterruptedError(err: unknown): boolean {
+    if (!err) return false;
+    const name = (err as { name?: string }).name;
+    if (name === 'AbortError') return true;
+    const msg = err instanceof Error ? err.message : String(err);
+    return /play\(\)\s+request\s+was\s+interrupted/i.test(msg);
+  }
+
   public async playTrack(track: Track, crossfadeSeconds = 0): Promise<void> {
     this.ensureAudioGraph();
+    const reqId = ++this.playRequestId;
+    void upgradeTrackArtworkToHdIfNeeded(track.id, track.title, track.artist);
 
     if (this.crossfadeTimer) {
-      window.clearInterval(this.crossfadeTimer);
+      window.clearTimeout(this.crossfadeTimer);
       this.crossfadeTimer = null;
     }
 
@@ -180,21 +219,65 @@ class SonoraAudioEngine {
     const incoming = this.decks[incomingName];
 
     if (!shouldCrossfade) {
-      outgoing.el.pause();
+      // Stop both decks immediately on manual Next/Previous or non-crossfade transitions
+      this.decks.A.el.pause();
+      this.decks.B.el.pause();
+      if (this.ctx) {
+        const now = this.ctx.currentTime;
+        this.decks.A.gain?.gain.cancelScheduledValues(now);
+        this.decks.B.gain?.gain.cancelScheduledValues(now);
+      }
     }
 
     const { url, isObjectUrl } = await this.resolveSourceUrl(track);
+
+    // If pause() or another playTrack() occurred while loading audio, abort cleanly without touching audio elements
+    if (reqId !== this.playRequestId) {
+      if (isObjectUrl) URL.revokeObjectURL(url);
+      return;
+    }
+
     this.releaseDeckUrl(incomingName);
     if (isObjectUrl) incoming.objectUrl = url;
 
     incoming.el.crossOrigin = 'anonymous';
     incoming.el.src = url;
+    incoming.el.currentTime = 0;
     incoming.el.playbackRate = this.currentSpeed;
-    incoming.el.volume = 1;
+    incoming.el.volume = this.masterGain ? 1 : this.currentVolume;
 
     this.activeDeck = incomingName;
 
-    await incoming.el.play();
+    // Ensure gain is ready BEFORE starting playback so the incoming track is never stuck at gain 0
+    if (this.ctx && incoming.gain) {
+      const now = this.ctx.currentTime;
+      incoming.gain.gain.cancelScheduledValues(now);
+      if (shouldCrossfade && outgoing.gain) {
+        outgoing.gain.gain.cancelScheduledValues(now);
+        incoming.gain.gain.setValueAtTime(0.01, now);
+      } else {
+        incoming.gain.gain.setValueAtTime(1, now);
+        const otherDeck = this.decks[incomingName === 'A' ? 'B' : 'A'];
+        if (otherDeck.gain) {
+          otherDeck.gain.gain.cancelScheduledValues(now);
+          otherDeck.gain.gain.setValueAtTime(0, now);
+        }
+      }
+    }
+
+    try {
+      await incoming.el.play();
+    } catch (err) {
+      if (this.isPlayInterruptedError(err) || reqId !== this.playRequestId) {
+        return;
+      }
+      throw err;
+    }
+
+    if (reqId !== this.playRequestId) {
+      incoming.el.pause();
+      return;
+    }
 
     if (shouldCrossfade && this.ctx && incoming.gain && outgoing.gain) {
       const now = this.ctx.currentTime;
@@ -205,25 +288,47 @@ class SonoraAudioEngine {
       outgoing.gain.gain.setValueAtTime(outgoing.gain.gain.value, now);
       outgoing.gain.gain.linearRampToValueAtTime(0, now + crossfadeSeconds);
       this.crossfadeTimer = window.setTimeout(() => {
-        outgoing.el.pause();
-        outgoing.el.currentTime = 0;
+        if (this.activeDeck !== outgoingName) {
+          outgoing.el.pause();
+          outgoing.el.currentTime = 0;
+        }
+        this.crossfadeTimer = null;
       }, crossfadeSeconds * 1000);
     } else if (this.ctx && incoming.gain) {
       const now = this.ctx.currentTime;
+      incoming.gain.gain.cancelScheduledValues(now);
       incoming.gain.gain.setValueAtTime(1, now);
-      if (outgoing !== incoming && outgoing.gain) {
-        outgoing.gain.gain.setValueAtTime(0, now);
+      const otherDeck = this.decks[incomingName === 'A' ? 'B' : 'A'];
+      if (otherDeck.gain) {
+        otherDeck.gain.gain.cancelScheduledValues(now);
+        otherDeck.gain.gain.setValueAtTime(0, now);
       }
     }
   }
 
   public pause() {
-    this.decks[this.activeDeck].el.pause();
+    this.playRequestId++;
+    if (this.crossfadeTimer) {
+      window.clearTimeout(this.crossfadeTimer);
+      this.crossfadeTimer = null;
+    }
+    this.decks.A.el.pause();
+    this.decks.B.el.pause();
   }
 
   public async resume() {
     this.ensureAudioGraph();
-    await this.decks[this.activeDeck].el.play();
+    const reqId = ++this.playRequestId;
+    const activeEl = this.decks[this.activeDeck].el;
+    if (!activeEl.src) return;
+    try {
+      await activeEl.play();
+    } catch (err) {
+      if (this.isPlayInterruptedError(err) || reqId !== this.playRequestId) {
+        return;
+      }
+      throw err;
+    }
   }
 
   public seek(seconds: number) {

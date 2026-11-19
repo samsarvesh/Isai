@@ -1,6 +1,7 @@
 import React, { useEffect, useState } from 'react';
 import { Disc3 } from 'lucide-react';
-import { getArtworkUrl } from '../db/sonoraDb';
+import { getArtworkUrl, subscribeArtworkUpdates } from '../db/sonoraDb';
+import { upgradeTrackArtworkToHdIfNeeded } from '../services/hdArtworkService';
 
 interface TrackArtworkProps {
   trackId?: string;
@@ -43,21 +44,34 @@ export const TrackArtwork: React.FC<TrackArtworkProps> = ({
   useEffect(() => {
     let mounted = true;
     setFailed(false);
-    if (artworkUrl) {
-      setSrc(artworkUrl);
+    // Show catalog URL immediately as instant placeholder, then prefer lossless/HD IndexedDB cover when present
+    setSrc(artworkUrl || null);
+
+    if (!trackId) {
       return;
     }
-    if (!trackId || !hasArtwork) {
-      setSrc(null);
-      return;
-    }
-    void getArtworkUrl(trackId).then((url) => {
-      if (mounted) setSrc(url);
+
+    void getArtworkUrl(trackId).then((localUrl) => {
+      if (!mounted) return;
+      if (localUrl) {
+        setSrc(localUrl);
+      } else if ((size === 'xl' || size === 'lg') && !artworkUrl && title && title !== 'ISAI') {
+        void upgradeTrackArtworkToHdIfNeeded(trackId, title, artist);
+      }
     });
+
+    const unsub = subscribeArtworkUpdates(trackId, (freshUrl) => {
+      if (mounted) {
+        setFailed(false);
+        setSrc(freshUrl);
+      }
+    });
+
     return () => {
       mounted = false;
+      unsub();
     };
-  }, [trackId, hasArtwork, artworkUrl]);
+  }, [trackId, hasArtwork, artworkUrl, size, title, artist]);
 
   const paletteIndex = (title.charCodeAt(0) + (artist?.charCodeAt(0) || 0)) % PALETTES.length;
 
@@ -70,7 +84,20 @@ export const TrackArtwork: React.FC<TrackArtworkProps> = ({
           src={src}
           alt={`${title} artwork`}
           referrerPolicy="no-referrer"
-          loading="lazy"
+          loading={size === 'xl' ? 'eager' : 'lazy'}
+          decoding="async"
+          onLoad={(e) => {
+            const img = e.currentTarget;
+            if (
+              trackId &&
+              title &&
+              title !== 'ISAI' &&
+              (size === 'xl' || size === 'lg' || size === 'md') &&
+              Math.max(img.naturalWidth, img.naturalHeight) < 700
+            ) {
+              void upgradeTrackArtworkToHdIfNeeded(trackId, title, artist);
+            }
+          }}
           onError={() => setFailed(true)}
           className="h-full w-full object-cover"
         />

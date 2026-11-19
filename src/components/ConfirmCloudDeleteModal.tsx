@@ -7,6 +7,9 @@ export const ConfirmCloudDeleteModal: React.FC = () => {
 
   if (!pendingCloudDeleteTrack) return null;
 
+  const isDrive = pendingCloudDeleteTrack.sourceType === 'gdrive';
+  const providerLabel = isDrive ? 'Google Drive' : 'Firebase Cloud';
+
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/65 backdrop-blur-sm p-4">
       <div
@@ -19,7 +22,7 @@ export const ConfirmCloudDeleteModal: React.FC = () => {
           <div className="flex items-center gap-2.5 text-rose-400">
             <AlertTriangle className="w-5 h-5 shrink-0" />
             <h2 id="cloud-delete-title" className="text-base font-bold text-[var(--text-primary)]">
-              Delete from Firebase Cloud?
+              Delete from {providerLabel}?
             </h2>
           </div>
           <button
@@ -34,7 +37,7 @@ export const ConfirmCloudDeleteModal: React.FC = () => {
         <p className="text-sm text-[var(--text-secondary)] leading-relaxed">
           This will permanently delete{' '}
           <strong className="text-[var(--text-primary)]">{pendingCloudDeleteTrack.title}</strong> (
-          {pendingCloudDeleteTrack.fileName}) and its audio chunks from your Firebase Cloud library.
+          {pendingCloudDeleteTrack.fileName}) from your {isDrive ? 'Google Drive ISAI Music Locker folder' : 'Firebase Cloud library'}. This action cannot be undone.
         </p>
 
         <div className="flex justify-end gap-2 pt-2 border-t border-[var(--border-subtle)]">
@@ -48,7 +51,7 @@ export const ConfirmCloudDeleteModal: React.FC = () => {
             onClick={() => void confirmDeleteCloudTrack()}
             className="px-4 py-2 rounded-lg bg-rose-600 text-white text-sm font-semibold hover:bg-rose-500 cursor-pointer"
           >
-            Delete from Cloud
+            Delete from {providerLabel}
           </button>
         </div>
       </div>

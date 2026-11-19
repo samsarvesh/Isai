@@ -1,8 +1,8 @@
 export type AudioFormat = 'mp3' | 'wav' | 'flac' | 'aac' | 'm4a' | 'ogg' | 'opus' | 'unknown';
 
-export type TrackSourceType = 'local' | 'firebase';
+export type TrackSourceType = 'local' | 'firebase' | 'gdrive';
 
-export type AudioAvailability = 'local' | 'firebase' | 'unavailable-offline';
+export type AudioAvailability = 'local' | 'firebase' | 'gdrive' | 'unavailable-offline';
 
 export interface ExternalPlaylist {
   id: string;
@@ -36,6 +36,7 @@ export interface Track {
   trackNumber?: number;
   duration: number; // seconds
   format: AudioFormat;
+  mimeType?: string;
   fileSize: number;
   fileName: string;
   duplicateKey: string; // normalized title|artist|roundedDuration
@@ -54,6 +55,7 @@ export interface Track {
   sourceType: TrackSourceType;
   streamUrl?: string;
   firebaseDocId?: string;
+  driveFileId?: string;
   catalogLicense?: string;
   catalogSource?: string;
 }
@@ -70,6 +72,8 @@ export interface Playlist {
   isAIGenerated?: boolean;
   mood?: MoodType;
 }
+
+export const ALL_SONGS_PLAYLIST_ID = '__all_songs__';
 
 export interface ListeningEvent {
   id: string;
@@ -111,9 +115,18 @@ export interface AppSettings {
   discoveryMode: boolean;
 }
 
+export interface LrcWord {
+  text: string;
+  start: number; // seconds
+  end: number; // seconds
+}
+
 export interface LrcLine {
   time: number; // seconds
+  endTime?: number; // seconds
   text: string;
+  words?: LrcWord[];
+  isSectionHeader?: boolean;
 }
 
 export interface ImportSummary {
@@ -136,6 +149,7 @@ export type NavView =
   | 'playlists'
   | 'playlist-detail'
   | 'lyrics'
+  | 'analytics'
   | 'settings';
 
 export type RepeatMode = 'off' | 'all' | 'one';

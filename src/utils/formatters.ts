@@ -29,7 +29,8 @@ export function formatBytes(bytes: number): string {
 
 export function getTrackAvailability(track: Track, isOnline: boolean): AudioAvailability {
   if (track.sourceType === 'local') return 'local';
-  return isOnline ? 'firebase' : 'unavailable-offline';
+  if (!isOnline) return 'unavailable-offline';
+  return track.sourceType === 'gdrive' ? 'gdrive' : 'firebase';
 }
 
 export function exportPlaylistToM3U8(playlist: Playlist, trackMap: Map<string, Track>): string {

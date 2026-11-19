@@ -2,7 +2,6 @@ import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { ListMusic, Maximize2, Pause, Play, Shuffle } from 'lucide-react';
 import { TrackArtwork } from '../components/TrackArtwork';
 import { useSonora } from '../contexts/SonoraContext';
-import type { Track } from '../types/music';
 import { WALLPAPER_PRESETS } from '../utils/wallpapers';
 
 function getGreeting(): string {
@@ -29,8 +28,6 @@ export const HomeView: React.FC = () => {
   const {
     currentTrack,
     tracks,
-    playlists,
-    trackMap,
     isPlaying,
     togglePlayPause,
     playTracksList,
@@ -39,22 +36,11 @@ export const HomeView: React.FC = () => {
     wallpaperId,
   } = useSonora();
 
-  // Gather unique songs from all playlists; fall back to full library if playlists have no songs yet
-  const homePlayPool = useMemo(() => {
-    const seen = new Set<string>();
-    const fromPlaylists: Track[] = [];
-    for (const pl of playlists) {
-      for (const id of pl.trackIds) {
-        if (seen.has(id)) continue;
-        const track = trackMap.get(id);
-        if (track) {
-          seen.add(id);
-          fromPlaylists.push(track);
-        }
-      }
-    }
-    return fromPlaylists.length > 0 ? fromPlaylists : tracks;
-  }, [playlists, trackMap, tracks]);
+  // Always play exclusively from the All Songs playlist (never limited to Liked or custom playlists)
+  const homePlayPool = useMemo(
+    () => [...tracks].sort((a, b) => b.dateAdded - a.dateAdded),
+    [tracks]
+  );
 
   const [now, setNow] = useState(() => new Date());
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
@@ -242,8 +228,8 @@ export const HomeView: React.FC = () => {
                 <button
                   type="button"
                   onClick={() => void playTracksList(homePlayPool, undefined, true)}
-                  aria-label="Shuffle all playlists"
-                  title="Shuffle all playlists"
+                  aria-label="Shuffle All Songs"
+                  title="Shuffle All Songs"
                   className="w-9 h-9 rounded-full text-white/75 hover:text-white hover:bg-white/10 flex items-center justify-center shrink-0 transition-colors cursor-pointer"
                 >
                   <Shuffle className="w-4 h-4" />

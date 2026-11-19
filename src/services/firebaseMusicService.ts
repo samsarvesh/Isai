@@ -1,18 +1,17 @@
 import { parseBlob } from 'music-metadata';
 import {
   collection,
-  deleteDoc,
   doc,
   getDocs,
   onSnapshot,
   query,
+  runTransaction,
   serverTimestamp,
-  setDoc,
-  updateDoc,
   where,
   type Timestamp,
 } from 'firebase/firestore';
 import {
+  clearCloudWriteQuotaLock,
   db,
   handleFirestoreError,
   isCloudWriteQuotaExceeded,
@@ -241,6 +240,49 @@ function mapDocToTrack(docData: FirestoreCloudTrackDoc, localStats?: LocalCloudS
   };
 }
 
+const FIREBASE_EMPTY_KEY_PREFIX = 'isai_firebase_locker_empty_v1_';
+
+export function isFirebaseLockerConfirmedEmpty(userId: string): boolean {
+  if (typeof window === 'undefined') return false;
+  try {
+    return window.localStorage.getItem(`${FIREBASE_EMPTY_KEY_PREFIX}${userId}`) === 'true';
+  } catch {
+    return false;
+  }
+}
+
+export function setFirebaseLockerConfirmedEmpty(userId: string, empty: boolean): void {
+  if (typeof window === 'undefined') return;
+  try {
+    const key = `${FIREBASE_EMPTY_KEY_PREFIX}${userId}`;
+    if (empty) {
+      window.localStorage.setItem(key, 'true');
+    } else {
+      window.localStorage.removeItem(key);
+    }
+  } catch {
+    // ignore storage errors
+  }
+}
+
+export async function fetchFirebaseCloudTracksOnce(userId: string): Promise<Track[]> {
+  if (typeof navigator !== 'undefined' && navigator.onLine === false) {
+    return [];
+  }
+  const q = query(collection(db, 'users', userId, 'cloudTracks'), where('ownerId', '==', userId));
+  const snapshot = await getDocs(q);
+  const localMap = readLocalCloudStatsMap();
+  const list = snapshot.docs.map((d) => {
+    const data = d.data() as FirestoreCloudTrackDoc;
+    return mapDocToTrack(data, localMap[data.id]);
+  });
+  list.sort((a, b) => b.dateAdded - a.dateAdded);
+  if (list.length === 0) {
+    setFirebaseLockerConfirmedEmpty(userId, true);
+  }
+  return list;
+}
+
 export function subscribeFirebaseCloudTracks(
   userId: string,
   onTracks: (tracks: Track[]) => void,
@@ -403,7 +445,11 @@ export async function uploadFilesToFirebaseCloud(
     if (matchedLrc) payload.lrcContent = matchedLrc;
 
     try {
-      await withFirestoreWriteGuard(setDoc(trackRef, payload));
+      await withFirestoreWriteGuard(
+        runTransaction(db, async (tx) => {
+          tx.set(trackRef, payload);
+        })
+      );
     } catch (err) {
       if (isQuotaExceededError(err) || (err instanceof Error && err.message === QUOTA_EXCEEDED_MESSAGE)) {
         markCloudWriteQuotaExceeded();
@@ -419,14 +465,17 @@ export async function uploadFilesToFirebaseCloud(
         const sliceBase64 = uint8ToBase64(rawBytes.subarray(start, end));
         const chunkId = `chunk_${idx}`;
         const chunkPath = `${trackPath}/chunks/${chunkId}`;
+        const chunkRef = doc(db, 'users', userId, 'cloudTracks', trackId, 'chunks', chunkId);
         try {
           await withFirestoreWriteGuard(
-            setDoc(doc(db, 'users', userId, 'cloudTracks', trackId, 'chunks', chunkId), {
-              ownerId: userId,
-              trackId,
-              index: idx,
-              data: sliceBase64,
-              createdAt: serverTimestamp(),
+            runTransaction(db, async (tx) => {
+              tx.set(chunkRef, {
+                ownerId: userId,
+                trackId,
+                index: idx,
+                data: sliceBase64,
+                createdAt: serverTimestamp(),
+              });
             }),
             15000
           );
@@ -441,7 +490,12 @@ export async function uploadFilesToFirebaseCloud(
     } catch (err) {
       // Clean up orphaned track document if chunk upload fails (best effort when quota allows)
       if (!isCloudWriteQuotaExceeded()) {
-        await withFirestoreWriteGuard(deleteDoc(trackRef), 5000).catch(() => {});
+        await withFirestoreWriteGuard(
+          runTransaction(db, async (tx) => {
+            tx.delete(trackRef);
+          }),
+          5000
+        ).catch(() => {});
       }
       throw err;
     }
@@ -526,7 +580,12 @@ export async function updateFirebaseCloudTrackMetadata(
   }
 
   try {
-    await withFirestoreWriteGuard(updateDoc(doc(db, 'users', userId, 'cloudTracks', trackId), patch));
+    const ref = doc(db, 'users', userId, 'cloudTracks', trackId);
+    await withFirestoreWriteGuard(
+      runTransaction(db, async (tx) => {
+        tx.update(ref, patch);
+      })
+    );
   } catch (err) {
     if (isQuotaExceededError(err) || (err instanceof Error && err.message === QUOTA_EXCEEDED_MESSAGE)) {
       markCloudWriteQuotaExceeded();
@@ -548,12 +607,15 @@ export async function updateFirebaseCloudTrackStats(
   }
   const path = `users/${userId}/cloudTracks/${trackId}`;
   try {
+    const ref = doc(db, 'users', userId, 'cloudTracks', trackId);
     await withFirestoreWriteGuard(
-      updateDoc(doc(db, 'users', userId, 'cloudTracks', trackId), {
-        isFavorite: stats.isFavorite,
-        playCount: Math.max(0, Math.trunc(stats.playCount)),
-        skipCount: Math.max(0, Math.trunc(stats.skipCount)),
-        updatedAt: serverTimestamp(),
+      runTransaction(db, async (tx) => {
+        tx.update(ref, {
+          isFavorite: stats.isFavorite,
+          playCount: Math.max(0, Math.trunc(stats.playCount)),
+          skipCount: Math.max(0, Math.trunc(stats.skipCount)),
+          updatedAt: serverTimestamp(),
+        });
       })
     );
   } catch (err) {
@@ -579,14 +641,16 @@ export async function deleteFirebaseCloudTrack(userId: string, trackId: string):
       where('ownerId', '==', userId)
     );
     const snap = await getDocs(q);
-    await withFirestoreWriteGuard(
-      Promise.all(
-        snap.docs.map((chunkDoc) =>
-          deleteDoc(doc(db, 'users', userId, 'cloudTracks', trackId, 'chunks', chunkDoc.id))
-        )
-      ),
-      15000
-    );
+    if (!snap.empty) {
+      await withFirestoreWriteGuard(
+        runTransaction(db, async (tx) => {
+          for (const chunkDoc of snap.docs) {
+            tx.delete(doc(db, 'users', userId, 'cloudTracks', trackId, 'chunks', chunkDoc.id));
+          }
+        }),
+        15000
+      );
+    }
   } catch (err) {
     if (isQuotaExceededError(err) || (err instanceof Error && err.message === QUOTA_EXCEEDED_MESSAGE)) {
       markCloudWriteQuotaExceeded();
@@ -596,7 +660,12 @@ export async function deleteFirebaseCloudTrack(userId: string, trackId: string):
   }
 
   try {
-    await withFirestoreWriteGuard(deleteDoc(doc(db, 'users', userId, 'cloudTracks', trackId)));
+    const trackRef = doc(db, 'users', userId, 'cloudTracks', trackId);
+    await withFirestoreWriteGuard(
+      runTransaction(db, async (tx) => {
+        tx.delete(trackRef);
+      })
+    );
     audioBlobCache.delete(trackId);
     removeLocalCloudTrackStats(trackId);
   } catch (err) {
@@ -606,4 +675,98 @@ export async function deleteFirebaseCloudTrack(userId: string, trackId: string):
     }
     handleFirestoreError(err, OperationType.DELETE, trackPath);
   }
+}
+
+export interface BulkFirebaseDeleteResult {
+  deletedIds: string[];
+  remainingCount: number;
+  quotaHit: boolean;
+}
+
+export async function deleteAllFirebaseCloudTracks(
+  userId: string,
+  onProgress?: (done: number, total: number, title: string) => void
+): Promise<BulkFirebaseDeleteResult> {
+  // Allow an explicit purge attempt even if an earlier upload set today's lock
+  clearCloudWriteQuotaLock();
+
+  const tracksQuery = query(
+    collection(db, 'users', userId, 'cloudTracks'),
+    where('ownerId', '==', userId)
+  );
+  const trackSnap = await getDocs(tracksQuery);
+  const docs = trackSnap.docs;
+  const total = docs.length;
+
+  if (total === 0) {
+    return { deletedIds: [], remainingCount: 0, quotaHit: false };
+  }
+
+  const deletedIds: string[] = [];
+  let quotaHit = false;
+
+  for (let i = 0; i < docs.length; i++) {
+    const trackDoc = docs[i];
+    const data = trackDoc.data() as Partial<FirestoreCloudTrackDoc>;
+    const trackId = trackDoc.id;
+    const title = data.title || data.fileName || trackId;
+    onProgress?.(i, total, title);
+
+    try {
+      const chunksQuery = query(
+        collection(db, 'users', userId, 'cloudTracks', trackId, 'chunks'),
+        where('ownerId', '==', userId)
+      );
+      const chunkSnap = await getDocs(chunksQuery);
+      const trackRef = doc(db, 'users', userId, 'cloudTracks', trackId);
+
+      // Delete the track doc + all its audio chunks in atomic fail-fast transaction(s)
+      const chunkDocs = chunkSnap.docs;
+      if (chunkDocs.length <= 250) {
+        await withFirestoreWriteGuard(
+          runTransaction(db, async (tx) => {
+            for (const c of chunkDocs) {
+              tx.delete(doc(db, 'users', userId, 'cloudTracks', trackId, 'chunks', c.id));
+            }
+            tx.delete(trackRef);
+          }),
+          15000
+        );
+      } else {
+        // Large track fallback: split chunk deletes, deleting parent doc in the first transaction
+        for (let offset = 0; offset < chunkDocs.length; offset += 200) {
+          const slice = chunkDocs.slice(offset, offset + 200);
+          await withFirestoreWriteGuard(
+            runTransaction(db, async (tx) => {
+              for (const c of slice) {
+                tx.delete(doc(db, 'users', userId, 'cloudTracks', trackId, 'chunks', c.id));
+              }
+              if (offset === 0) {
+                tx.delete(trackRef);
+              }
+            }),
+            15000
+          );
+        }
+      }
+
+      audioBlobCache.delete(trackId);
+      removeLocalCloudTrackStats(trackId);
+      deletedIds.push(trackId);
+      onProgress?.(deletedIds.length, total, title);
+    } catch (err) {
+      if (isQuotaExceededError(err) || (err instanceof Error && err.message === QUOTA_EXCEEDED_MESSAGE)) {
+        markCloudWriteQuotaExceeded();
+        quotaHit = true;
+        break;
+      }
+      throw err;
+    }
+  }
+
+  return {
+    deletedIds,
+    remainingCount: Math.max(0, total - deletedIds.length),
+    quotaHit,
+  };
 }

@@ -7,20 +7,25 @@ import {
   Minimize2,
   Pause,
   Play,
-  Radio,
   Repeat,
   Repeat1,
   Shuffle,
   SkipBack,
   SkipForward,
   SlidersHorizontal,
+  Volume1,
+  Volume2,
+  VolumeX,
 } from 'lucide-react';
 import { useSonora } from '../contexts/SonoraContext';
-import { getActiveLrcIndex, parseLrcOrPlainLyrics } from '../services/lyricsService';
+import { parseLrcOrPlainLyrics } from '../services/lyricsService';
+import { ACCENT_COLORS } from '../types/music';
 import { formatDuration } from '../utils/formatters';
 import { Artwork3D } from './Artwork3D';
 import { AudioVisualizer } from './AudioVisualizer';
+import { ScrubField } from './ScrubField';
 import { StylishProgressBar } from './StylishProgressBar';
+import { SyncedLyricsView } from './SyncedLyricsView';
 
 const PLAYBACK_SPEEDS = [0.75, 1, 1.15, 1.25, 1.5, 2];
 
@@ -43,10 +48,11 @@ export const FullScreenPlayer: React.FC = () => {
     seekTo,
     toggleShuffle,
     cycleRepeat,
+    setVolume,
     setSpeed,
     setSleepTimer,
     toggleFavorite,
-    startSmartRadio,
+    isQueueOpen,
     setIsQueueOpen,
     setIsEqualizerOpen,
     setActiveView,
@@ -56,23 +62,51 @@ export const FullScreenPlayer: React.FC = () => {
   const [sleepMenuOpen, setSleepMenuOpen] = useState(false);
   const [speedMenuOpen, setSpeedMenuOpen] = useState(false);
   const [mobileToolsOpen, setMobileToolsOpen] = useState(false);
-  const activeLineRef = useRef<HTMLButtonElement | null>(null);
+  const lastNonZeroVolumeRef = useRef<number>(settings.volume > 0 ? settings.volume : 0.85);
+
+  useEffect(() => {
+    if (settings.volume > 0) {
+      lastNonZeroVolumeRef.current = settings.volume;
+    }
+  }, [settings.volume]);
+
+  const volumePercent = Math.round(settings.volume * 100);
+  const accentHex =
+    settings.theme === 'light'
+      ? ACCENT_COLORS[settings.accent]?.light ?? '#d97706'
+      : ACCENT_COLORS[settings.accent]?.dark ?? '#e5a038';
+  const chipSurface = settings.theme === 'light' ? 'rgba(241, 245, 249, 0.92)' : 'rgba(24, 24, 29, 0.78)';
+
+  const handleVolumeChange = (pct: number) => {
+    const normalized = Math.max(0, Math.min(1, pct / 100));
+    setVolume(normalized);
+  };
+
+  const handleToggleMute = () => {
+    if (settings.volume > 0) {
+      lastNonZeroVolumeRef.current = settings.volume;
+      setVolume(0);
+    } else {
+      setVolume(lastNonZeroVolumeRef.current > 0 ? lastNonZeroVolumeRef.current : 0.85);
+    }
+  };
+
+  const volumeIcon =
+    volumePercent === 0 ? (
+      <VolumeX className="w-4 h-4 text-[var(--text-muted)]" />
+    ) : volumePercent < 50 ? (
+      <Volume1 className="w-4 h-4 text-[var(--accent)]" />
+    ) : (
+      <Volume2 className="w-4 h-4 text-[var(--accent)]" />
+    );
 
   const parsedLyrics = useMemo(() => {
     if (!currentTrack) return null;
-    return parseLrcOrPlainLyrics(currentTrack.lrcContent || currentTrack.embeddedLyrics);
-  }, [currentTrack]);
-
-  const activeLrcIndex = useMemo(() => {
-    if (!parsedLyrics?.isSynchronized) return -1;
-    return getActiveLrcIndex(parsedLyrics.synced, currentTime);
-  }, [parsedLyrics, currentTime]);
-
-  useEffect(() => {
-    if (isFullPlayerOpen && showLyrics && activeLineRef.current) {
-      activeLineRef.current.scrollIntoView({ behavior: 'smooth', block: 'center' });
-    }
-  }, [activeLrcIndex, isFullPlayerOpen, showLyrics]);
+    return parseLrcOrPlainLyrics(
+      currentTrack.lrcContent || currentTrack.embeddedLyrics,
+      duration || currentTrack.duration
+    );
+  }, [currentTrack, duration]);
 
   if (!isFullPlayerOpen || !currentTrack) return null;
 
@@ -120,9 +154,10 @@ export const FullScreenPlayer: React.FC = () => {
           </p>
         </div>
 
-        <div className="flex items-center gap-2 shrink-0">
-          {/* Desktop / Tablet Audio & Timer Controls (Relocated from bottom) */}
-          <div className="hidden md:inline-flex items-center gap-1 rounded-full bg-[var(--bg-surface)] border border-[var(--border-subtle)] p-1">
+        {/* Single Unified Right-Side Frosted Glass Control Bar (1x · Sleep · EQ · Lyrics · Playlist) */}
+        <div className="inline-flex items-center gap-0.5 rounded-full bg-[var(--bg-surface)]/90 backdrop-blur-xl border border-[var(--border-subtle)] p-1 shadow-[inset_0_1px_0_rgba(255,255,255,0.08),0_8px_24px_rgba(0,0,0,0.28)] shrink-0">
+          {/* Desktop / Tablet Speed, Sleep & EQ */}
+          <div className="hidden md:inline-flex items-center gap-0.5">
             {/* Speed Dropdown */}
             <div className="relative">
               <button
@@ -131,7 +166,7 @@ export const FullScreenPlayer: React.FC = () => {
                   setSleepMenuOpen(false);
                   setSpeedMenuOpen((v) => !v);
                 }}
-                className={`min-h-[32px] px-2.5 rounded-full text-[13px] font-mono tabular-nums transition-colors cursor-pointer whitespace-nowrap ${
+                className={`min-h-[34px] px-3 rounded-full text-[13px] font-mono tabular-nums transition-colors cursor-pointer whitespace-nowrap ${
                   settings.playbackSpeed !== 1
                     ? 'bg-[var(--accent-soft)] text-[var(--accent)] font-semibold'
                     : 'text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)]'
@@ -169,7 +204,7 @@ export const FullScreenPlayer: React.FC = () => {
                   setSpeedMenuOpen(false);
                   setSleepMenuOpen((v) => !v);
                 }}
-                className={`inline-flex items-center gap-1.5 min-h-[32px] px-2.5 rounded-full text-[13px] transition-colors cursor-pointer whitespace-nowrap ${
+                className={`inline-flex items-center gap-1.5 min-h-[34px] px-3 rounded-full text-[13px] transition-colors cursor-pointer whitespace-nowrap ${
                   sleepRemainingSeconds !== null || sleepEndOfTrack
                     ? 'bg-[var(--accent-soft)] text-[var(--accent)] font-medium'
                     : 'text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)]'
@@ -226,22 +261,14 @@ export const FullScreenPlayer: React.FC = () => {
               )}
             </div>
 
-            {/* Smart Radio */}
-            <button
-              type="button"
-              onClick={() => void startSmartRadio(currentTrack)}
-              className="inline-flex items-center gap-1.5 min-h-[32px] px-2.5 rounded-full text-[13px] text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors cursor-pointer whitespace-nowrap"
-              title="Start Smart Radio from this song"
-            >
-              <Radio className="w-3.5 h-3.5" />
-              <span>Radio</span>
-            </button>
-
             {/* Equalizer */}
             <button
               type="button"
-              onClick={() => setIsEqualizerOpen(true)}
-              className="inline-flex items-center gap-1.5 min-h-[32px] px-2.5 rounded-full text-[13px] text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors cursor-pointer whitespace-nowrap"
+              onClick={() => {
+                closeMenus();
+                setIsEqualizerOpen(true);
+              }}
+              className="inline-flex items-center gap-1.5 min-h-[34px] px-3 rounded-full text-[13px] text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors cursor-pointer whitespace-nowrap"
               title="Open 10-Band Equalizer"
             >
               <SlidersHorizontal className="w-3.5 h-3.5" />
@@ -249,13 +276,13 @@ export const FullScreenPlayer: React.FC = () => {
             </button>
           </div>
 
-          {/* Mobile Compact Tools Menu (< md) */}
+          {/* Mobile Compact Tools Menu (< md) inside the same unified capsule */}
           <div className="relative md:hidden">
             <button
               type="button"
               onClick={() => setMobileToolsOpen((v) => !v)}
-              aria-label="Audio speed, sleep timer, radio, and equalizer"
-              className="min-h-[40px] min-w-[40px] flex items-center justify-center rounded-full bg-[var(--bg-surface)] border border-[var(--border-subtle)] text-[var(--text-secondary)] hover:text-[var(--text-primary)] cursor-pointer"
+              aria-label="Audio speed, sleep timer, and equalizer"
+              className="min-h-[34px] min-w-[34px] flex items-center justify-center rounded-full text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors cursor-pointer"
             >
               <SlidersHorizontal className="w-4 h-4" />
             </button>
@@ -303,32 +330,25 @@ export const FullScreenPlayer: React.FC = () => {
                   </div>
                 </div>
 
-                <div className="flex gap-2 pt-1 border-t border-[var(--border-subtle)]">
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setMobileToolsOpen(false);
-                      void startSmartRadio(currentTrack);
-                    }}
-                    className="flex-1 flex items-center justify-center gap-1.5 py-2 rounded-lg bg-[var(--bg-elevated)] text-[13px] cursor-pointer"
-                  >
-                    <Radio className="w-3.5 h-3.5" /> Radio
-                  </button>
+                <div className="pt-1 border-t border-[var(--border-subtle)]">
                   <button
                     type="button"
                     onClick={() => {
                       setMobileToolsOpen(false);
                       setIsEqualizerOpen(true);
                     }}
-                    className="flex-1 flex items-center justify-center gap-1.5 py-2 rounded-lg bg-[var(--bg-elevated)] text-[13px] cursor-pointer"
+                    className="w-full flex items-center justify-center gap-1.5 py-2 rounded-lg bg-[var(--bg-elevated)] text-[13px] cursor-pointer"
                   >
-                    <SlidersHorizontal className="w-3.5 h-3.5" /> EQ
+                    <SlidersHorizontal className="w-3.5 h-3.5" /> 10-Band Equalizer
                   </button>
                 </div>
               </div>
             )}
           </div>
 
+          <span className="w-px h-4 bg-white/10 mx-1 shrink-0" aria-hidden="true" />
+
+          {/* Lyrics Toggle */}
           <button
             type="button"
             onClick={() => {
@@ -336,25 +356,33 @@ export const FullScreenPlayer: React.FC = () => {
               setShowLyrics((v) => !v);
             }}
             aria-pressed={showLyrics}
-            className={`inline-flex items-center gap-1.5 min-h-[40px] px-3.5 py-1.5 rounded-full text-sm font-medium transition-colors cursor-pointer whitespace-nowrap ${
+            className={`inline-flex items-center gap-1.5 min-h-[34px] px-3 rounded-full text-[13px] font-medium transition-colors cursor-pointer whitespace-nowrap ${
               showLyrics
-                ? 'bg-[var(--accent)] text-[var(--accent-contrast)]'
-                : 'bg-[var(--bg-surface)] border border-[var(--border-subtle)] text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)]'
+                ? 'bg-[var(--accent)] text-[var(--accent-contrast)] shadow-sm'
+                : 'text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)]'
             }`}
           >
-            <MicVocal className="w-4 h-4" />
+            <MicVocal className="w-3.5 h-3.5" />
             <span>Lyrics</span>
           </button>
 
+          <span className="w-px h-4 bg-white/10 mx-1 shrink-0" aria-hidden="true" />
+
+          {/* Playlist & Queue Toggle */}
           <button
             type="button"
             onClick={() => {
               closeMenus();
-              setIsFullPlayerOpen(false);
-              setIsQueueOpen(true);
+              setIsQueueOpen(!isQueueOpen);
             }}
-            aria-label="Open queue"
-            className="min-h-[40px] min-w-[40px] flex items-center justify-center rounded-full bg-[var(--bg-surface)] border border-[var(--border-subtle)] text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors cursor-pointer"
+            aria-label="Open playlist and queue"
+            aria-pressed={isQueueOpen}
+            className={`min-h-[34px] min-w-[34px] px-2 flex items-center justify-center rounded-full transition-colors cursor-pointer ${
+              isQueueOpen
+                ? 'bg-[var(--accent)] text-[var(--accent-contrast)] shadow-sm'
+                : 'text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)]'
+            }`}
+            title="Up Next & Playlists"
           >
             <ListMusic className="w-4 h-4" />
           </button>
@@ -362,12 +390,12 @@ export const FullScreenPlayer: React.FC = () => {
       </header>
 
       {/* Main Content: Centered in the middle of the viewport */}
-      <div className="relative z-10 flex-1 min-h-0 w-full flex items-center justify-center px-5 sm:px-8 lg:px-14 py-4 sm:py-6 overflow-hidden">
+      <div className="relative z-10 flex-1 min-h-0 w-full flex items-center justify-center gap-5 lg:gap-8 px-5 sm:px-8 lg:px-12 py-4 sm:py-6 overflow-hidden">
         <div
           className={
             showLyrics
-              ? 'w-full max-w-6xl mx-auto grid grid-cols-1 md:grid-cols-12 gap-6 lg:gap-10 items-center h-full'
-              : 'w-full max-w-[980px] mx-auto flex flex-col md:flex-row items-center justify-center gap-6 sm:gap-8 lg:gap-14'
+              ? 'flex-1 min-w-0 max-w-6xl grid grid-cols-1 md:grid-cols-12 gap-6 lg:gap-10 items-center h-full'
+              : 'w-full max-w-[980px] flex flex-col md:flex-row items-center justify-center gap-6 sm:gap-8 lg:gap-14'
           }
         >
           {/* Artwork (with 3D effect) + Mobile / Lyrics compact deck */}
@@ -400,7 +428,11 @@ export const FullScreenPlayer: React.FC = () => {
                 <h2 className="text-xl sm:text-2xl font-bold truncate leading-tight">{currentTrack.title}</h2>
                 <p className="text-sm text-[var(--text-secondary)] truncate mt-0.5">
                   {currentTrack.artist} · {currentTrack.language} ·{' '}
-                  {currentTrack.sourceType === 'firebase' ? 'Firebase Cloud' : currentTrack.format.toUpperCase()}
+                  {currentTrack.sourceType === 'gdrive'
+                    ? 'Google Drive'
+                    : currentTrack.sourceType === 'firebase'
+                    ? 'Firebase Cloud'
+                    : currentTrack.format.toUpperCase()}
                 </p>
               </div>
               <button
@@ -483,7 +515,11 @@ export const FullScreenPlayer: React.FC = () => {
                 </h2>
                 <p className="text-base lg:text-lg text-[var(--text-secondary)] truncate mt-1.5">
                   {currentTrack.artist} · {currentTrack.album} · {currentTrack.language} ·{' '}
-                  {currentTrack.sourceType === 'firebase' ? 'Firebase Cloud' : currentTrack.format.toUpperCase()}
+                  {currentTrack.sourceType === 'gdrive'
+                    ? 'Google Drive'
+                    : currentTrack.sourceType === 'firebase'
+                    ? 'Firebase Cloud'
+                    : currentTrack.format.toUpperCase()}
                 </p>
               </div>
               <button
@@ -563,7 +599,11 @@ export const FullScreenPlayer: React.FC = () => {
               <div className="flex items-center gap-2.5">
                 <MicVocal className="w-5 h-5 text-[var(--accent)]" />
                 <span className="text-base font-semibold">
-                  {parsedLyrics?.isSynchronized ? 'Synchronized Lyrics' : 'Lyrics'}
+                  {parsedLyrics?.isSynchronized
+                    ? parsedLyrics.isAutoSynced
+                      ? 'Auto-Synced Lyrics'
+                      : 'Synchronized Lyrics'
+                    : 'Lyrics'}
                 </span>
               </div>
               <button
@@ -577,33 +617,15 @@ export const FullScreenPlayer: React.FC = () => {
               </button>
             </div>
 
-            <div className="flex-1 overflow-y-auto pr-2 space-y-3.5">
-              {parsedLyrics?.isSynchronized ? (
-                parsedLyrics.synced.map((line, i) => {
-                  const isActive = i === activeLrcIndex;
-                  return (
-                    <button
-                      key={`${line.time}-${i}`}
-                      ref={isActive ? activeLineRef : undefined}
-                      onClick={() => seekTo(line.time)}
-                      className={`w-full text-left text-lg sm:text-xl leading-relaxed transition-all cursor-pointer block ${
-                        isActive
-                          ? 'font-bold text-[var(--text-primary)] scale-[1.01] origin-left'
-                          : i < activeLrcIndex
-                          ? 'text-[var(--text-muted)]'
-                          : 'text-[var(--text-secondary)] hover:text-[var(--text-primary)]'
-                      }`}
-                    >
-                      {line.text}
-                    </button>
-                  );
-                })
-              ) : parsedLyrics && parsedLyrics.plain.length > 0 ? (
-                parsedLyrics.plain.map((line, i) => (
-                  <p key={i} className="text-base sm:text-lg leading-relaxed text-[var(--text-secondary)]">
-                    {line}
-                  </p>
-                ))
+            <div className="flex-1 overflow-y-auto pr-2">
+              {parsedLyrics && parsedLyrics.synced.length > 0 ? (
+                <SyncedLyricsView
+                  lines={parsedLyrics.synced}
+                  currentTime={currentTime}
+                  isPlaying={isPlaying}
+                  compact
+                  onSeek={seekTo}
+                />
               ) : (
                 <div className="h-full flex flex-col items-center justify-center text-center px-4">
                   <p className="text-base font-semibold text-[var(--text-primary)] mb-1.5">No lyrics loaded for this track</p>
@@ -624,6 +646,68 @@ export const FullScreenPlayer: React.FC = () => {
             </div>
           </div>
         )}
+        </div>
+
+        {/* Vertical Studio Glass ScrubField Volume Control positioned on the right side near the music playing window */}
+        <div className="hidden md:flex flex-col items-center justify-center shrink-0">
+          <ScrubField
+            orientation="vertical"
+            label="VOL"
+            suffix="%"
+            value={volumePercent}
+            defaultValue={85}
+            min={0}
+            max={100}
+            step={1}
+            size="lg"
+            sensitivity={2}
+            rubberReach={8}
+            returnDuration={300}
+            coarseMultiplier={10}
+            fineMultiplier={1}
+            showDelta
+            showDirty={false}
+            showFill
+            active={isPlaying && volumePercent > 0}
+            accent={accentHex}
+            chipColor={chipSurface}
+            icon={volumeIcon}
+            iconAriaLabel={volumePercent === 0 ? 'Unmute audio' : 'Mute audio'}
+            onIconClick={handleToggleMute}
+            onChange={handleVolumeChange}
+            onCommit={handleVolumeChange}
+          />
+        </div>
+
+        {/* Compact floating vertical ScrubField on small screens (right side near player) */}
+        <div className="md:hidden fixed right-2.5 top-1/2 -translate-y-1/2 z-20">
+          <ScrubField
+            orientation="vertical"
+            label="VOL"
+            suffix="%"
+            value={volumePercent}
+            defaultValue={85}
+            min={0}
+            max={100}
+            step={1}
+            size="sm"
+            sensitivity={2}
+            rubberReach={8}
+            returnDuration={300}
+            coarseMultiplier={10}
+            fineMultiplier={1}
+            showDelta
+            showDirty={false}
+            showFill
+            active={isPlaying && volumePercent > 0}
+            accent={accentHex}
+            chipColor={chipSurface}
+            icon={volumeIcon}
+            iconAriaLabel={volumePercent === 0 ? 'Unmute audio' : 'Mute audio'}
+            onIconClick={handleToggleMute}
+            onChange={handleVolumeChange}
+            onCommit={handleVolumeChange}
+          />
         </div>
       </div>
     </div>

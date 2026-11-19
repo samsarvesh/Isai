@@ -24,13 +24,22 @@ export const SettingsView: React.FC = () => {
     tracks,
     localTracks,
     firebaseTracks,
+    driveTracks,
     playlists,
     firebaseUser,
     isFirebaseConnected,
+    isDriveConnected,
+    needsDriveReconnect,
     isFirebaseSigningIn,
     isSyncingCloud,
+    isDeletingAllFirebase,
+    firebaseDeleteProgress,
+    hideLegacyFirebaseTracks,
+    setHideLegacyFirebaseTracks,
+    deleteAllFirebaseTracks,
     connectFirebaseCloud,
     disconnectFirebaseCloud,
+    refreshDriveLibrary,
     updateSettings,
     refreshAllData,
     resetLibraryData,
@@ -40,6 +49,7 @@ export const SettingsView: React.FC = () => {
 
   const backupInputRef = useRef<HTMLInputElement | null>(null);
   const [confirmReset, setConfirmReset] = useState(false);
+  const [confirmPurgeFirebase, setConfirmPurgeFirebase] = useState(false);
 
   const handleExportBackup = async () => {
     const json = await exportBackupJson();
@@ -78,7 +88,7 @@ export const SettingsView: React.FC = () => {
         <div>
           <h1 className="text-2xl sm:text-3xl font-bold tracking-tight">Settings</h1>
           <p className="text-sm text-[var(--text-muted)] mt-1">
-            Accent color, audio playback, Firebase Cloud Locker, backup, and installation
+            Accent color, audio playback, Google Drive Music Locker, backup, and installation
           </p>
         </div>
         <p className="text-sm font-mono tabular-nums text-[var(--text-muted)]">
@@ -173,20 +183,22 @@ export const SettingsView: React.FC = () => {
           </div>
         </section>
 
-        {/* Firebase Cloud Music Locker */}
+        {/* Google Drive Cloud Music Locker */}
         <section className="rounded-2xl border border-[var(--border-subtle)] bg-[var(--bg-surface)] p-6 flex flex-col justify-between gap-4">
           <div className="flex flex-col sm:flex-row sm:items-start justify-between gap-4">
             <div className="flex items-start gap-3">
               <Cloud className="w-5 h-5 text-[var(--accent)] mt-0.5 shrink-0" />
               <div>
                 <h2 className="text-lg font-bold flex items-center gap-2">
-                  Firebase Cloud Music Locker
+                  Google Drive Music Locker
                   {isSyncingCloud && <Loader2 className="w-4 h-4 animate-spin text-[var(--accent)]" />}
                 </h2>
                 <p className="text-sm text-[var(--text-secondary)] mt-1 leading-relaxed">
                   {isFirebaseConnected
-                    ? `Connected as ${firebaseUser?.email || 'Google Account'} · ${firebaseTracks.length} cloud track(s) synced live.`
-                    : 'Sign in with Google to store downloaded songs in your private Firebase Cloud library and save laptop disk space.'}
+                    ? `Signed in as ${firebaseUser?.email || 'Google Account'} · ${driveTracks.length} Google Drive song(s) ready${
+                        firebaseTracks.length > 0 ? ` · ${firebaseTracks.length} legacy Firebase song(s)` : ''
+                      }. You stay signed in until you click Sign Out.`
+                    : 'Connect your Google Drive to bulk-upload hundreds of MP3, FLAC, M4A, or WAV songs using your own Drive storage (15 GB+) with no daily Firestore write limits.'}
                 </p>
               </div>
             </div>
@@ -196,21 +208,89 @@ export const SettingsView: React.FC = () => {
                 <GoogleSignInButton
                   onClick={() => void connectFirebaseCloud()}
                   loading={isFirebaseSigningIn}
-                  label="Sign in for Firebase Cloud"
+                  label="Connect Google Drive"
                 />
               ) : (
-                <button
-                  onClick={() => void disconnectFirebaseCloud()}
-                  className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-lg bg-[var(--bg-elevated)] text-sm text-rose-400 hover:bg-[var(--bg-hover)] cursor-pointer whitespace-nowrap shrink-0"
-                >
-                  <LogOut className="w-4 h-4" /> Sign Out
-                </button>
+                <>
+                  <button
+                    onClick={() => void refreshDriveLibrary()}
+                    disabled={isSyncingCloud || isFirebaseSigningIn}
+                    className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-lg bg-[var(--bg-elevated)] text-sm text-[var(--text-primary)] hover:bg-[var(--bg-hover)] disabled:opacity-50 cursor-pointer whitespace-nowrap shrink-0"
+                  >
+                    Sync Drive
+                  </button>
+                  <button
+                    onClick={() => void disconnectFirebaseCloud()}
+                    className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-lg bg-[var(--bg-elevated)] text-sm text-rose-400 hover:bg-[var(--bg-hover)] cursor-pointer whitespace-nowrap shrink-0"
+                  >
+                    <LogOut className="w-4 h-4" /> Sign Out
+                  </button>
+                </>
               )}
             </div>
           </div>
           <p className="text-[13px] text-[var(--text-muted)] pt-3 border-t border-[var(--border-subtle)] leading-relaxed">
-            Audio chunks and metadata are stored privately at <code className="font-mono">users/{'{uid}'}/cloudTracks</code> under strict Firestore Security Rules.
+            ISAI only accesses files it creates inside your dedicated <code className="font-mono">ISAI Music Locker</code> Google Drive folder (least-privilege <code className="font-mono">drive.file</code> access).
           </p>
+
+          {firebaseTracks.length > 0 && (
+            <div className="pt-3 border-t border-[var(--border-subtle)] flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+              <div className="text-xs text-[var(--text-secondary)]">
+                <span className="font-semibold text-rose-300">
+                  {firebaseTracks.length} legacy Firebase Cloud song{firebaseTracks.length === 1 ? '' : 's'}
+                </span>
+                {firebaseDeleteProgress
+                  ? ` · Removing ${firebaseDeleteProgress.done} / ${firebaseDeleteProgress.total} (${firebaseDeleteProgress.title})`
+                  : hideLegacyFirebaseTracks
+                  ? ' · Hidden from library'
+                  : ' · Delete them permanently from Firestore'}
+              </div>
+              <div className="flex flex-wrap items-center gap-2 shrink-0">
+                {isDeletingAllFirebase ? (
+                  <span className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-rose-500/20 text-rose-300 text-xs font-semibold">
+                    <Loader2 className="w-3.5 h-3.5 animate-spin" /> Removing...
+                  </span>
+                ) : !confirmPurgeFirebase ? (
+                  <>
+                    <button
+                      type="button"
+                      onClick={() => setConfirmPurgeFirebase(true)}
+                      className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-rose-500/20 hover:bg-rose-500/30 text-rose-300 text-xs font-semibold cursor-pointer whitespace-nowrap"
+                    >
+                      <Trash2 className="w-3.5 h-3.5" /> Remove All Firebase Songs
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setHideLegacyFirebaseTracks(!hideLegacyFirebaseTracks)}
+                      className="px-3 py-1.5 rounded-lg bg-[var(--bg-elevated)] hover:bg-[var(--bg-hover)] text-xs text-[var(--text-secondary)] cursor-pointer whitespace-nowrap"
+                    >
+                      {hideLegacyFirebaseTracks ? 'Show' : 'Hide'}
+                    </button>
+                  </>
+                ) : (
+                  <>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setConfirmPurgeFirebase(false);
+                        void deleteAllFirebaseTracks();
+                      }}
+                      className="px-3 py-1.5 rounded-lg bg-rose-500 hover:bg-rose-600 text-white text-xs font-semibold cursor-pointer whitespace-nowrap"
+                    >
+                      Confirm Delete ({firebaseTracks.length})
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setConfirmPurgeFirebase(false)}
+                      className="px-3 py-1.5 rounded-lg bg-[var(--bg-elevated)] text-xs text-[var(--text-secondary)] cursor-pointer whitespace-nowrap"
+                    >
+                      Cancel
+                    </button>
+                  </>
+                )}
+              </div>
+            </div>
+          )}
         </section>
 
         {/* Backup, Restore & Privacy */}
@@ -221,7 +301,8 @@ export const SettingsView: React.FC = () => {
               <h2 className="text-lg font-bold">Backup, Restore &amp; Privacy</h2>
             </div>
             <p className="text-sm text-[var(--text-secondary)] leading-relaxed">
-              {localTracks.length} local track(s), {firebaseTracks.length} Firebase Cloud track(s), {playlists.length} playlist(s), LRC lyrics, and preferences are stored privately on your device and account.
+              {driveTracks.length} Google Drive song(s), {localTracks.length} local track(s)
+              {firebaseTracks.length > 0 ? `, ${firebaseTracks.length} Firebase track(s)` : ''}, {playlists.length} playlist(s), LRC lyrics, and preferences are stored privately on your device and Google account.
             </p>
           </div>
 
@@ -303,8 +384,9 @@ export const SettingsView: React.FC = () => {
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-x-6 gap-y-2.5 text-sm">
             {[
               ['Space', 'Play / Pause'],
+              ['Up / Down', 'Volume ±5%'],
               ['Left / Right', 'Seek ±5 seconds'],
-              ['Shift + N / P', 'Next / Previous'],
+              ['N / P', 'Next / Previous'],
               ['M', 'Mute / Unmute'],
               ['L', 'Open Lyrics'],
               ['F', 'Full-screen Player'],

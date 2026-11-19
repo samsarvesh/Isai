@@ -110,9 +110,7 @@ export const Artwork3D: React.FC<Artwork3DProps> = ({
             rotateY: prefersReducedMotion ? 0 : rotateY,
             boxShadow,
           }}
-          animate={{ scale: isHovered && !prefersReducedMotion ? 1.025 : 1 }}
-          transition={{ type: 'spring', stiffness: 280, damping: 24 }}
-          className="relative rounded-3xl will-change-transform"
+          className="relative rounded-3xl"
         >
           {/* Layer -3: Accent-tinted deep studio halo behind artwork */}
           <div

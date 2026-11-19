@@ -1,7 +1,8 @@
 import React, { useMemo, useState } from 'react';
-import { Check, ChevronDown, Home, ListMusic, MicVocal, Palette, Settings } from 'lucide-react';
+import { BarChart3, Check, ChevronDown, Home, ListMusic, Palette, Settings } from 'lucide-react';
 import { BottomPlayer } from './components/BottomPlayer';
 import { ConfirmCloudDeleteModal } from './components/ConfirmCloudDeleteModal';
+import { ConfirmDriveUpdateModal } from './components/ConfirmDriveUpdateModal';
 import { EqualizerModal } from './components/EqualizerModal';
 import { ErrorBoundary } from './components/ErrorBoundary';
 import { FullScreenPlayer } from './components/FullScreenPlayer';
@@ -13,6 +14,7 @@ import { TrackEditorModal } from './components/TrackEditorModal';
 import { SonoraProvider, useSonora } from './contexts/SonoraContext';
 import type { NavView } from './types/music';
 import { WALLPAPER_PRESETS } from './utils/wallpapers';
+import { AnalyticsView } from './views/AnalyticsView';
 import { HomeView } from './views/HomeView';
 import { LyricsView } from './views/LyricsView';
 import { PlaylistDetailView } from './views/PlaylistDetailView';
@@ -39,6 +41,8 @@ const SonoraShell: React.FC = () => {
         return <PlaylistDetailView />;
       case 'lyrics':
         return <LyricsView />;
+      case 'analytics':
+        return <AnalyticsView />;
       case 'settings':
         return <SettingsView />;
       default:
@@ -53,7 +57,12 @@ const SonoraShell: React.FC = () => {
     () => [
       { value: 'home', icon: <Home className="w-[18px] h-[18px]" />, ariaLabel: 'Home', title: 'Home' },
       { value: 'playlists', icon: <ListMusic className="w-[18px] h-[18px]" />, ariaLabel: 'Playlists', title: 'Playlists' },
-      { value: 'lyrics', icon: <MicVocal className="w-[18px] h-[18px]" />, ariaLabel: 'Lyrics', title: 'Lyrics' },
+      {
+        value: 'analytics',
+        icon: <BarChart3 className="w-[18px] h-[18px]" />,
+        ariaLabel: 'Listening & App Analytics',
+        title: 'Listening & App Analytics',
+      },
       { value: 'settings', icon: <Settings className="w-[18px] h-[18px]" />, ariaLabel: 'Settings', title: 'Settings' },
     ],
     []
@@ -220,6 +229,7 @@ const SonoraShell: React.FC = () => {
       <EqualizerModal />
       <TrackEditorModal />
       <ConfirmCloudDeleteModal />
+      <ConfirmDriveUpdateModal />
 
       {/* Non-blocking Toasts */}
       {toasts.length > 0 && (

@@ -11,18 +11,18 @@ import {
   MicVocal,
   Save,
 } from 'lucide-react';
+import { SyncedLyricsView } from '../components/SyncedLyricsView';
 import { TrackArtwork } from '../components/TrackArtwork';
 import { useSonora } from '../contexts/SonoraContext';
 import {
   formatLrcTimestamp,
-  getActiveLrcIndex,
   parseLrcOrPlainLyrics,
   searchPermittedOnlineLyrics,
   type OnlineLyricsCandidate,
 } from '../services/lyricsService';
 
 export const LyricsView: React.FC = () => {
-  const { currentTrack, currentTime, isOnline, seekTo, saveTrackEdits, notify } = useSonora();
+  const { currentTrack, currentTime, duration, isPlaying, isOnline, seekTo, saveTrackEdits, notify } = useSonora();
 
   const [isEditing, setIsEditing] = useState(false);
   const [draftLyrics, setDraftLyrics] = useState('');
@@ -30,14 +30,12 @@ export const LyricsView: React.FC = () => {
   const [searchingOnline, setSearchingOnline] = useState(false);
   const [candidates, setCandidates] = useState<OnlineLyricsCandidate[]>([]);
   const lrcInputRef = useRef<HTMLInputElement | null>(null);
-  const activeLineRef = useRef<HTMLButtonElement | null>(null);
 
   const rawLyrics = currentTrack?.lrcContent || currentTrack?.embeddedLyrics || '';
 
-  const parsed = useMemo(() => parseLrcOrPlainLyrics(rawLyrics), [rawLyrics]);
-  const activeIdx = useMemo(
-    () => (parsed.isSynchronized ? getActiveLrcIndex(parsed.synced, currentTime) : -1),
-    [parsed, currentTime]
+  const parsed = useMemo(
+    () => parseLrcOrPlainLyrics(rawLyrics, duration || currentTrack?.duration),
+    [rawLyrics, duration, currentTrack?.duration]
   );
 
   useEffect(() => {
@@ -45,12 +43,6 @@ export const LyricsView: React.FC = () => {
     setCandidates([]);
     setDraftLyrics(rawLyrics);
   }, [currentTrack?.id, rawLyrics]);
-
-  useEffect(() => {
-    if (!isEditing && activeLineRef.current) {
-      activeLineRef.current.scrollIntoView({ behavior: 'smooth', block: 'center' });
-    }
-  }, [activeIdx, isEditing]);
 
   if (!currentTrack) {
     return (
@@ -138,7 +130,12 @@ export const LyricsView: React.FC = () => {
           <div className="min-w-0">
             <h1 className="text-xl sm:text-2xl font-bold truncate">{currentTrack.title}</h1>
             <p className="text-sm text-[var(--text-secondary)] truncate">
-              {currentTrack.artist} · {parsed.isSynchronized ? 'Synchronized LRC' : rawLyrics ? 'Static Lyrics' : 'No Lyrics Attached'}
+              {currentTrack.artist} ·{' '}
+              {parsed.isSynchronized
+                ? parsed.isAutoSynced
+                  ? 'Auto-Synced Lyrics (Word Highlight)'
+                  : 'Synchronized LRC (Word Highlight)'
+                : 'No Lyrics Attached'}
             </p>
           </div>
         </div>
@@ -248,39 +245,14 @@ export const LyricsView: React.FC = () => {
             isFullscreenLyrics ? 'flex-1' : 'min-h-[420px] max-h-[65vh]'
           }`}
         >
-          {parsed.isSynchronized ? (
-            <div className="max-w-3xl mx-auto space-y-4">
-              {parsed.synced.map((line, i) => {
-                const isActive = i === activeIdx;
-                return (
-                  <button
-                    key={`${line.time}-${i}`}
-                    ref={isActive ? activeLineRef : undefined}
-                    onClick={() => seekTo(line.time)}
-                    className={`w-full text-left flex items-baseline gap-4 transition-all cursor-pointer ${
-                      isActive
-                        ? 'text-xl sm:text-2xl font-bold text-[var(--text-primary)]'
-                        : i < activeIdx
-                        ? 'text-base sm:text-lg text-[var(--text-muted)]'
-                        : 'text-base sm:text-lg text-[var(--text-secondary)] hover:text-[var(--text-primary)]'
-                    }`}
-                  >
-                    <span className="text-[13px] font-mono tabular-nums text-[var(--text-muted)] shrink-0">
-                      {formatLrcTimestamp(line.time).replace(/[\[\]]/g, '')}
-                    </span>
-                    <span className="leading-relaxed">{line.text}</span>
-                  </button>
-                );
-              })}
-            </div>
-          ) : parsed.plain.length > 0 ? (
-            <div className="max-w-2xl mx-auto space-y-3">
-              {parsed.plain.map((line, i) => (
-                <p key={i} className="text-base sm:text-lg leading-relaxed text-[var(--text-secondary)]">
-                  {line}
-                </p>
-              ))}
-            </div>
+          {parsed.synced.length > 0 ? (
+            <SyncedLyricsView
+              lines={parsed.synced}
+              currentTime={currentTime}
+              isPlaying={isPlaying}
+              showTimestamps={!parsed.isAutoSynced}
+              onSeek={seekTo}
+            />
           ) : (
             <div className="h-full flex flex-col items-center justify-center text-center py-12 space-y-3">
               <MicVocal className="w-9 h-9 text-[var(--text-muted)]" />

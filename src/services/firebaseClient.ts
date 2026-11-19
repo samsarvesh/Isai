@@ -1,26 +1,35 @@
 import { initializeApp, getApps } from 'firebase/app';
 import {
+  browserLocalPersistence,
   getAuth,
   GoogleAuthProvider,
   onAuthStateChanged,
+  setPersistence,
   signInWithPopup,
   type User,
 } from 'firebase/auth';
 import {
-  disableNetwork,
   doc,
-  enableNetwork,
   getDocFromServer,
   getFirestore,
   initializeFirestore,
   memoryLocalCache,
+  setLogLevel,
   type Firestore,
 } from 'firebase/firestore';
 import firebaseConfig from '../../firebase-applet-config.json';
 
+// Prevent noisy internal Firestore SDK offline/backoff logs; app surfaces actionable errors via UI toasts
+setLogLevel('silent');
+
 const app = getApps().length > 0 ? getApps()[0] : initializeApp(firebaseConfig);
 
 export const auth = getAuth(app);
+void setPersistence(auth, browserLocalPersistence).catch(() => {});
+
+const firestoreDatabaseId =
+  (firebaseConfig as { firestoreDatabaseId?: string }).firestoreDatabaseId ||
+  'ai-studio-sonora-a914d687-b02b-4a2c-a092-7fd35db72227';
 
 let dbInstance: Firestore;
 try {
@@ -31,10 +40,10 @@ try {
       ignoreUndefinedProperties: true,
       localCache: memoryLocalCache(),
     },
-    firebaseConfig.firestoreDatabaseId
+    firestoreDatabaseId
   );
 } catch {
-  dbInstance = getFirestore(app, firebaseConfig.firestoreDatabaseId);
+  dbInstance = getFirestore(app, firestoreDatabaseId);
 }
 export const db = dbInstance;
 
@@ -78,6 +87,17 @@ export function markCloudWriteQuotaExceeded(): void {
   }
 }
 
+export function clearCloudWriteQuotaLock(): void {
+  writeQuotaExceeded = false;
+  if (typeof window !== 'undefined') {
+    try {
+      window.localStorage.removeItem(QUOTA_LOCK_STORAGE_KEY);
+    } catch {
+      // ignore storage errors
+    }
+  }
+}
+
 export function isQuotaExceededError(error: unknown): boolean {
   const code = (error as { code?: string })?.code;
   if (code === 'resource-exhausted') return true;
@@ -86,9 +106,9 @@ export function isQuotaExceededError(error: unknown): boolean {
 }
 
 export const QUOTA_EXCEEDED_MESSAGE =
-  'Daily Firebase Cloud write quota has been reached. Cloud reads and local playback continue normally, and cloud writes will resume after the daily reset.';
+  'Daily Firebase Cloud write quota has been reached. Use "Add Local Files" for unlimited offline playback; cloud writes will resume after the daily reset.';
 
-export async function withFirestoreWriteGuard<T>(writePromise: Promise<T>, timeoutMs = 10000): Promise<T> {
+export async function withFirestoreWriteGuard<T>(writePromise: Promise<T>, timeoutMs = 12000): Promise<T> {
   if (isCloudWriteQuotaExceeded()) {
     throw new Error(QUOTA_EXCEEDED_MESSAGE);
   }
@@ -108,9 +128,6 @@ export async function withFirestoreWriteGuard<T>(writePromise: Promise<T>, timeo
     if (timer !== undefined) window.clearTimeout(timer);
     if (err instanceof Error && err.message === '__FIRESTORE_WRITE_TIMEOUT__') {
       markCloudWriteQuotaExceeded();
-      // Reset the active WriteStream connection so the SDK does not keep retrying every 60s
-      await disableNetwork(db).catch(() => {});
-      await enableNetwork(db).catch(() => {});
       throw new Error(QUOTA_EXCEEDED_MESSAGE);
     }
     if (isQuotaExceededError(err)) {
@@ -121,7 +138,26 @@ export async function withFirestoreWriteGuard<T>(writePromise: Promise<T>, timeo
   }
 }
 
+export const GOOGLE_DRIVE_SCOPES = [
+  'https://www.googleapis.com/auth/drive.file',
+] as const;
+
 const provider = new GoogleAuthProvider();
+for (const scope of GOOGLE_DRIVE_SCOPES) {
+  provider.addScope(scope);
+}
+
+// Access token cached strictly in memory (never localStorage or sessionStorage)
+let isSigningIn = false;
+let cachedDriveAccessToken: string | null = null;
+
+export function getDriveAccessToken(): string | null {
+  return cachedDriveAccessToken;
+}
+
+export function clearDriveAccessToken(): void {
+  cachedDriveAccessToken = null;
+}
 
 export const OperationType = {
   CREATE: 'create',
@@ -183,27 +219,46 @@ export async function testFirestoreConnection(): Promise<void> {
     await getDocFromServer(doc(db, 'test', 'connection'));
   } catch (error) {
     const code = (error as { code?: string })?.code;
-    if (code === 'permission-denied') {
-      // Expected when signed out or reading the blocked test/connection sentinel path
+    if (code === 'permission-denied' || code === 'unavailable') {
       return;
-    }
-    if (error instanceof Error && error.message.includes('the client is offline')) {
-      console.warn('Firestore client is currently offline.');
     }
   }
 }
 
-void testFirestoreConnection();
-
-export function subscribeToFirebaseAuth(callback: (user: User | null) => void) {
-  return onAuthStateChanged(auth, callback);
+export function subscribeToFirebaseAuth(callback: (user: User | null, driveToken: string | null) => void) {
+  return onAuthStateChanged(auth, (user) => {
+    if (!user) {
+      cachedDriveAccessToken = null;
+      callback(null, null);
+      return;
+    }
+    if (cachedDriveAccessToken) {
+      callback(user, cachedDriveAccessToken);
+    } else if (!isSigningIn) {
+      cachedDriveAccessToken = null;
+      callback(user, null);
+    }
+  });
 }
 
-export async function signInWithFirebaseGoogle(): Promise<User> {
-  provider.setCustomParameters({ prompt: 'select_account' });
+export async function signInWithFirebaseGoogle(
+  options?: { forceAccountSelect?: boolean }
+): Promise<{ user: User; accessToken: string | null }> {
+  const activeEmail = auth.currentUser?.email;
+  if (activeEmail && !options?.forceAccountSelect) {
+    // Already signed in: hint their active account so Google skips the account picker when refreshing Drive access
+    provider.setCustomParameters({ login_hint: activeEmail });
+  } else {
+    provider.setCustomParameters({ prompt: 'select_account' });
+  }
+  isSigningIn = true;
   try {
+    await setPersistence(auth, browserLocalPersistence).catch(() => {});
     const result = await signInWithPopup(auth, provider);
-    return result.user;
+    const credential = GoogleAuthProvider.credentialFromResult(result);
+    const accessToken = credential?.accessToken ?? null;
+    cachedDriveAccessToken = accessToken;
+    return { user: result.user, accessToken };
   } catch (error) {
     const code = (error as { code?: string })?.code;
     if (code === 'auth/unauthorized-domain') {
@@ -219,9 +274,12 @@ export async function signInWithFirebaseGoogle(): Promise<User> {
       throw new Error('Sign-in window was closed before completing Google authentication.');
     }
     throw error;
+  } finally {
+    isSigningIn = false;
   }
 }
 
 export async function signOutFirebase(): Promise<void> {
+  cachedDriveAccessToken = null;
   await auth.signOut();
 }
