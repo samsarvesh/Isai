@@ -1,4 +1,4 @@
-# SONORA — Personal AI Music Ecosystem
+# ISAI — Personal AI Music Ecosystem
 
 SONORA is a free, ad-free, local-first personal music player, synchronized lyrics studio, and offline-capable AI playlist assistant built for desktop (Windows, macOS, Linux) and mobile browsers (Android PWA / iOS Safari).
 
